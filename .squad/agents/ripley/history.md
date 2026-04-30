@@ -47,6 +47,14 @@
 - **Concurrent Bishop analysis confirmed.** 6-vector threat model matches architectural review findings.
 - **Decision merged into primary decisions.md entry.**
 
+### 2026-04-29 — Security Mitigations Documentation
+
+- **Created `docs/security.md`** — full security review document for the cross-tenant AKS workload identity solution. Covers five sections: threat model overview (with trust boundary diagram and token exchange flow), confused deputy mitigation (three independent enforcement layers), six additional attack vectors from the security audit, honest residual risks, and a quick-reference operator checklist.
+- **Three-layer confused deputy defense documented explicitly:** (1) IB RBAC `SubjectAccessReview` gate, (2) FIC exact-subject constraint (`system:serviceaccount:aks-xtenant-auth:timestampwriter`), (3) audience scoping (`api://AKSIdentityBinding` only). Explained why all three must be bypassed simultaneously.
+- **SA impersonation threat documented honestly** — acknowledged as viable attack path if namespace write access is obtained; documented that Kubernetes has no pod-level RBAC primitive and the control boundary is namespace discipline.
+- **All cross-references included:** `deploy/clusterrole.yaml`, `deploy/clusterrolebinding.yaml`, `deploy/networkpolicy.yaml`, `cmd/timestampwriter/main.go`, `cmd/setup/main.go`, `docs/azure-setup.md`.
+- **Operator checklist** includes 11 controls with concrete verification guidance (exact audience strings, CIDR values, regex patterns).
+
 ### 2026-04-30 — Broad Code & Security Audit
 
 - **Overall verdict: LOW risk posture.** Token handling, CSRF, consent flow, RBAC manifests, and image supply chain are all sound. No exploitable vulnerabilities in the primary threat model identified.
