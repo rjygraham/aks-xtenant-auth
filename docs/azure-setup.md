@@ -179,13 +179,13 @@ OIDC_ISSUER_URL=$(az aks show \
 echo "OIDC Issuer URL: $OIDC_ISSUER_URL"
 ```
 
-**Save this URL**. You will use it in Step 4 and Step 3.
+**Save this URL.** It is available for reference and diagnostic purposes. Step 4 uses the Identity Binding OIDC issuer URL (`$IB_OIDC_ISSUER_URL` from Step 2b) as the FIC issuer, not this cluster OIDC issuer.
 
 ---
 
 ## Step 2: Create User-Assigned Managed Identity (UAMI) in source tenant
 
-While we will use a **multi-tenant Entra app registration** as the primary identity (Step 4), we first create a UAMI for reference and for the federated credential. The UAMI's federated credential will link to the Entra app.
+While we will use a **multi-tenant Entra app registration** as the primary identity (Step 4), we first create a UAMI to anchor the Identity Binding. AKS will automatically manage a FIC on this UAMI (Step 3). The Entra app's FIC (Step 4) trusts the UAMI's Identity Binding OIDC issuer — this is the bridge between the cluster and the multi-tenant app.
 
 ```bash
 az account set --subscription "$SOURCE_SUBSCRIPTION_ID"
@@ -404,6 +404,19 @@ APP_OBJECT_ID=$(az ad app show \
 echo "App Object ID: $APP_OBJECT_ID"
 ```
 
+### Create a service principal for the app in the source (home) tenant:
+
+Multi-tenant apps do **not** auto-create a service principal in their own (source) tenant on registration. Without this, Entra cannot perform the federated credential exchange and will return `AADSTS7000229`.
+
+```bash
+az account set --subscription "$SOURCE_SUBSCRIPTION_ID"
+
+# Create SP in the source/home tenant — required for FIC exchange
+az ad sp create --id "$APP_CLIENT_ID"
+
+echo "Service principal created in source (home) tenant"
+```
+
 ### Add a federated credential to the Entra app:
 
 The federated credential tells Entra ID: "Trust OIDC tokens from this Identity Binding's issuer and exchange them for access tokens."
@@ -425,7 +438,7 @@ az ad app federated-credential create \
     "name": "aks-identity-binding-credential",
     "issuer": "'"$IB_OIDC_ISSUER_URL"'",
     "subject": "system:serviceaccount:'"${K8S_NAMESPACE}"':'"${K8S_SERVICE_ACCOUNT}"'",
-    "audiences": ["api://AzureADTokenExchange"]
+    "audiences": ["api://AKSIdentityBinding"]
   }'
 
 echo "Federated credential created on Entra app registration"
@@ -1043,7 +1056,7 @@ The complete authentication flow:
 │  │  • Federated Credential:                                             │   │
 │  │    - Issuer: <IB_OIDC_ISSUER_URL>                                      │   │
 │  │    - Subject: system:serviceaccount:aks-xtenant-auth:timestampwriter │   │
-│  │    - Audience: api://AzureADTokenExchange                            │   │
+│  │    - Audience: api://AKSIdentityBinding                            │   │
 │  └──────────────────────┬───────────────────────────────────────────────┘   │
 │                         │ Validates federated credential (OIDC signature)   │
 │                         │ Issues app-only access token for target tenant   │
