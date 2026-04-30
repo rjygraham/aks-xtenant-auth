@@ -54,6 +54,50 @@ Migrated Kubernetes manifests to support Identity Bindings:
 
 **Rationale:** Identity Bindings provides UAMI-scoped OIDC issuer (stable across clusters). Single FIC per UAMI shared across all clusters eliminates 20-FIC limit scaling constraint.
 
+## Security Audit 2026-04-30
+
+**Status:** Complete + Hardening Fixes Committed  
+**Agents:** Bishop (Azure/Identity), Ripley (Code/Architecture), Vasquez (Attack Scenarios)
+
+### Key Decisions
+
+1. **Container-Scoped RBAC** (Bishop + Team consensus): Target Storage RBAC narrowed from account scope to container scope. This limits blast radius of potential cross-tenant compromise (Vasquez Scenario 3a) to the specific container, not the entire storage account. Applied to `docs/azure-setup.md` Step 9 and `cmd/setup/templates/success.html`.
+
+2. **One-Time Write Guard for Setup Wizard** (Vasquez P1 + Team consensus): Setup `POST /configure` now rejects re-runs unless `setup.db` is empty. Prevents silent production config override if setup is re-invoked (Vasquez Scenario 5a). Implemented in `cmd/setup/main.go`.
+
+3. **NetworkPolicy for Identity Isolation** (Ripley + Team consensus): New `deploy/networkpolicy.yaml` enforces:
+   - Deny all ingress (setup wizard accessible only via kubectl port-forward).
+   - Allow DNS + HTTPS egress (legitimate workload needs).
+   - Block `169.254.169.254` IMDS egress (mitigates Vasquez Scenario 6b: UAMI token theft by other pods).
+
+4. **Input Validation on Storage Names** (Ripley + Team consensus): Added regex validation for storage account name and container name before Azure SDK calls in `cmd/timestampwriter/main.go`. Eliminates ambiguity if SQLite data is compromised (Ripley Gap #1–2). Also added in `cmd/setup/main.go` for form POST.
+
+5. **Per-Upload Timeout** (Vasquez Scenario 1c + Team consensus): Wrapped blob write in `context.WithTimeout(15s)` to prevent indefinite stalls. Prevents a hung upload from blocking all subsequent ticks.
+
+6. **FIC Issuer / Audience Correctness Verified** (Bishop audit + Team rejection): Bishop repeated prior error that FIC issuer should be cluster OIDC URL. Team confirmed existing production FIC (`09c0d7e3`) is correct: uses cluster standard OIDC issuer + audience `api://AKSIdentityBinding`. Decision documented in `decisions/bishop-identity-chain.md`.
+
+7. **Documentation Cleanup** (Bishop + Ripley): Removed stale PKCE/Graph/ARM guidance from `docs/azure-setup.md`. Option B section now matches actual simplified admin-consent implementation. Fixed stale comment in `Dockerfile.setup` ("PKCE callbacks" → "admin consent callbacks").
+
+8. **Namespace RBAC Security Warning** (Vasquez Scenario 3a + Team consensus): Documented in `docs/azure-setup.md` that pod creation RBAC in `aks-xtenant-auth` namespace should be restricted to deployment pipeline only. Kubernetes has no pod-level RBAC primitive; namespace discipline is the control. This is a high-priority operational constraint — not a code fix, but process discipline.
+
+### Priority Fixes (Completed)
+
+| Priority | Finding | Status |
+|----------|---------|--------|
+| P0 | Namespace write → SA impersonation → cross-tenant blob write (Vasquez 3a) | MITIGATED: container-scoped RBAC + namespace warning documented |
+| P1 | Setup wizard silent config override (Vasquez 5a) | FIXED: one-time write guard |
+| P2 | IMDS accessible from all pods (Vasquez 6b) | FIXED: NetworkPolicy blocks 169.254.169.254 |
+| P2 | Storage account underspec'd (Bishop) | FIXED: hardening flags in docs/azure-setup.md |
+| P2 | Input validation gaps (Ripley) | FIXED: regex validation added |
+| P3 | Upload timeout missing (Vasquez 1c) | FIXED: 15s context.WithTimeout |
+| Low | Docs drift (Bishop/Ripley) | FIXED: Option B rewrite, PKCE comment fix |
+
+### Overall Posture
+- **Azure/Identity:** Tight (FIC issuer/audience correct; ServiceAccount annotation fixed)
+- **Kubernetes-Internal:** Medium → Low (NetworkPolicy + namespace discipline)
+- **Data Validation:** Low → Mitigated (regex validation + one-time write guard)
+- **Risk Classification:** LOW (after fixes)
+
 ## Governance
 
 - All meaningful changes require team consensus
