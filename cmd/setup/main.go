@@ -1,3 +1,46 @@
+// Package main implements the setup wizard binary.
+//
+// # What this binary does
+//
+// The setup wizard is a small web application that a *source-tenant admin*
+// runs once to onboard a new *target tenant* admin. It walks the target tenant
+// admin through two steps:
+//
+//  1. Grant admin consent for the multi-tenant Entra application (so it has a
+//     service principal in the target tenant).
+//  2. Record which Azure Blob Storage account and container the timestampwriter
+//     should write to.
+//
+// After the wizard completes, the timestampwriter pod reads the saved
+// configuration from the shared SQLite database and begins writing blobs.
+//
+// # Admin consent link approach
+//
+// The wizard uses the simplest possible OAuth2 flow: a browser redirect to
+// Microsoft's /adminconsent endpoint. This requires no token exchange, no
+// Graph API calls, and no ARM calls. The target tenant admin uses their own
+// browser session and credentials — the setup wizard never handles any tokens.
+//
+// CSRF is prevented by a short-lived HttpOnly cookie ("setup_state", 10-min
+// MaxAge) that holds a random hex state value. Microsoft echoes the state back
+// on the callback; the handler validates it before trusting the response.
+//
+// # SQLite on NFS
+//
+// Configuration is stored in a SQLite database at SETUP_DB_PATH (default
+// /data/setup.db). The file lives on an Azure Files NFS mount shared with the
+// timestampwriter pod. NFS is required because the subscription policy blocks
+// key-based Azure Files authentication (which SMB mounts depend on).
+//
+// The timestampwriter reads the most recent row from this DB on each tick,
+// allowing it to pick up new configuration without restarting.
+//
+// # Routes
+//
+//   GET /             – landing page (index.html)
+//   GET /start-consent – generates state, sets cookie, redirects to Microsoft
+//   GET /callback      – validates consent response, shows configure form
+//   POST /configure    – saves storage account details to SQLite, shows success
 package main
 
 import (
@@ -20,28 +63,53 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// templateFS embeds all HTML templates at compile time so the binary is
+// self-contained (no external files needed in the container image).
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// config holds runtime configuration sourced entirely from environment variables.
+// All values are resolved once at startup by loadConfig.
 type config struct {
+	// clientID is the multi-tenant Entra application's client ID. This is the
+	// app that target-tenant admins will grant consent to. Sourced from
+	// AZURE_CLIENT_ID (set via the setup-config ConfigMap).
 	clientID     string
+	// redirectBase is the base URL that Microsoft will redirect back to after
+	// consent (e.g. http://localhost:8081 when using kubectl port-forward).
 	redirectBase string
+	// port is the TCP port the HTTP server listens on.
 	port         string
+	// dbPath is the path to the SQLite database file shared with the
+	// timestampwriter pod. Defaults to /data/setup.db.
 	dbPath       string
 }
 
+// configureData is the template data passed to configure.html — the form
+// shown after a successful admin consent. It pre-populates the target tenant
+// ID (returned by Microsoft in the callback) as a hidden field.
 type configureData struct {
 	TenantID string
 }
 
+// savedData is the template data passed to success.html after the admin
+// submits the storage configuration form. It carries all values needed to
+// render the pre-filled az CLI command and ConfigMap YAML snippets.
 type savedData struct {
+	// ClientID is the multi-tenant Entra app client ID — shown in the ConfigMap
+	// snippet as the AZURE_CLIENT_ID override that the timestampwriter uses.
 	ClientID           string
+	// TenantID is the *target* tenant ID returned by Microsoft in the consent
+	// callback. Note: AZURE_TENANT_ID in the ConfigMap should be the *source*
+	// tenant (where the Entra app is registered), not this value.
 	TenantID           string
 	ResourceID         string
 	ContainerName      string
-	StorageAccountName string // derived from ResourceID
+	// StorageAccountName is derived from ResourceID for display convenience.
+	StorageAccountName string
 }
 
+// errorData is the template data passed to error.html.
 type errorData struct {
 	Error            string
 	ErrorDescription string
@@ -56,6 +124,9 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// renderTemplate writes the named template to the response writer. Errors are
+// logged but not returned — by the time Execute fails the HTTP headers are
+// already sent, so there's nothing useful to do except log.
 func renderTemplate(w http.ResponseWriter, tmpl *template.Template, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tmpl.ExecuteTemplate(w, name, data); err != nil {
@@ -63,14 +134,22 @@ func renderTemplate(w http.ResponseWriter, tmpl *template.Template, name string,
 	}
 }
 
+// handleIndex renders the landing page (index.html) with no dynamic data.
 func handleIndex(tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		renderTemplate(w, tmpl, "index.html", nil)
 	}
 }
 
-// handleStartConsent generates a state token, stores it in a short-lived cookie,
-// and redirects the browser to the Microsoft admin consent URL.
+// handleStartConsent generates a CSRF state token, stores it in a short-lived
+// HttpOnly cookie, and redirects the browser to the Microsoft admin consent URL.
+//
+// The /common/adminconsent endpoint is used (not a specific tenant) so that
+// admins from *any* target tenant can complete consent in a single flow.
+// Microsoft will redirect back to /callback with the consented tenant ID.
+//
+// The state cookie (MaxAge: 600s) is the sole CSRF mechanism — no server-side
+// session map is needed, which avoids state loss if the pod restarts mid-flow.
 func handleStartConsent(cfg config, tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		state, err := randomHex(16)
@@ -84,7 +163,7 @@ func handleStartConsent(cfg config, tmpl *template.Template) http.HandlerFunc {
 			Path:     "/",
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
-			MaxAge:   600,
+			MaxAge:   600, // 10 minutes — enough time for an admin to complete consent
 		})
 		params := url.Values{
 			"client_id":    {cfg.clientID},
@@ -96,8 +175,15 @@ func handleStartConsent(cfg config, tmpl *template.Template) http.HandlerFunc {
 }
 
 // handleCallback handles the Microsoft admin consent redirect.
-// Success: admin_consent=True + tenant query params present.
-// Failure: error + error_description query params present.
+//
+// Microsoft sends one of two responses:
+//   - Success: admin_consent=True + tenant={targetTenantID} + state={…}
+//   - Failure: error={code} + error_description={…}
+//
+// On success the handler validates the CSRF state cookie, clears it, and
+// renders the storage configuration form (configure.html) pre-populated with
+// the target tenant ID. The admin then enters their storage account details
+// and submits to POST /configure.
 func handleCallback(cfg config, tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -110,6 +196,9 @@ func handleCallback(cfg config, tmpl *template.Template) http.HandlerFunc {
 			return
 		}
 
+		// Validate the state cookie before trusting anything in the callback.
+		// A mismatch means either a CSRF attempt or the cookie expired
+		// (admin took longer than 10 minutes to complete consent).
 		cookie, err := r.Cookie("setup_state")
 		if err != nil || cookie.Value != q.Get("state") {
 			renderTemplate(w, tmpl, "error.html", errorData{
@@ -135,6 +224,10 @@ func handleCallback(cfg config, tmpl *template.Template) http.HandlerFunc {
 	}
 }
 
+// loadConfig reads all configuration from environment variables and returns a
+// populated config struct. AZURE_CLIENT_ID is the only required value — it
+// must match the client ID of the multi-tenant Entra app registration.
+// All other values have sensible defaults for local kubectl port-forward usage.
 func loadConfig() (config, error) {
 	clientID := os.Getenv("AZURE_CLIENT_ID")
 	if clientID == "" {
@@ -155,6 +248,11 @@ func loadConfig() (config, error) {
 	return config{clientID: clientID, redirectBase: redirectBase, port: port, dbPath: dbPath}, nil
 }
 
+// createTableSQL creates the consents table if it doesn't already exist.
+// Each row represents a completed setup: one target tenant admin granting
+// consent and recording their storage account. The timestampwriter reads
+// the most recent row to determine where to write blobs.
+// Using CREATE TABLE IF NOT EXISTS makes initDB safe to call on every startup.
 const createTableSQL = `
 CREATE TABLE IF NOT EXISTS consents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,6 +262,12 @@ CREATE TABLE IF NOT EXISTS consents (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
 
+// initDB opens the SQLite database at path, creating it if necessary, and
+// ensures the consents table exists. The database file lives on an Azure Files
+// NFS mount shared between the setup pod and the timestampwriter pod.
+//
+// modernc.org/sqlite is used (pure Go, no CGO) so the binary works in a
+// distroless container where a CGO-based driver would fail to find libc.
 func initDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -188,6 +292,18 @@ func parseStorageAccountName(resourceID string) (string, error) {
 	return "", fmt.Errorf("storageAccounts segment not found in resource ID %q", resourceID)
 }
 
+// handleConfigure processes the storage configuration form submitted after
+// admin consent. It:
+//  1. Validates the resource ID by extracting the storage account name.
+//  2. Persists the consent row to SQLite.
+//  3. Renders success.html with pre-filled az CLI and ConfigMap YAML snippets
+//     for the admin to copy.
+//
+// The RBAC assignment (Storage Blob Data Contributor) is *not* automated here.
+// success.html displays a pre-filled "az role assignment create" command for
+// the admin to run manually. This keeps the setup wizard stateless with
+// respect to ARM and avoids requiring Owner/User Access Admin permissions in
+// the wizard itself.
 func handleConfigure(cfg config, db *sql.DB, tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.FormValue("tenant_id")
@@ -226,6 +342,10 @@ func handleConfigure(cfg config, db *sql.DB, tmpl *template.Template) http.Handl
 	}
 }
 
+// run parses templates, registers HTTP routes, starts the server, and waits
+// for ctx to be cancelled (SIGTERM/SIGINT) before performing a graceful
+// 5-second shutdown. This keeps main() minimal — all meaningful logic lives
+// in the handler functions.
 func run(ctx context.Context, cfg config, db *sql.DB, logger *slog.Logger) error {
 	tmpl, err := template.ParseFS(templateFS, "templates/*.html")
 	if err != nil {
@@ -262,6 +382,8 @@ func run(ctx context.Context, cfg config, db *sql.DB, logger *slog.Logger) error
 	return nil
 }
 
+// main is the entry point. It loads config, initialises the SQLite DB,
+// wires up graceful shutdown via context cancellation, and delegates to run().
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
