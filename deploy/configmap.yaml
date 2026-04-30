@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: timestampwriter-config
+  namespace: aks-xtenant-auth
+data:
+  # STORAGE_ACCOUNT_URL and STORAGE_CONTAINER_NAME are optional overrides.
+  # When both are set, the timestampwriter uses them directly.
+  # When left empty (the default), the app reads storage configuration from
+  # the setup wizard's SQLite database at SETUP_DB_PATH (/data/setup.db).
+  # Leave these blank unless you are bypassing the setup wizard entirely.
+  STORAGE_ACCOUNT_URL: "https://<STORAGE_ACCOUNT_NAME>.blob.core.windows.net/"
+  STORAGE_CONTAINER_NAME: "xtenant"
+
+  # Multi-tenant Entra app client ID used for cross-tenant token exchange.
+  # This MUST be set to the APP_CLIENT_ID from docs/azure-setup.md Step 4.
+  # It overrides the UAMI client ID injected by the workload identity webhook,
+  # allowing WorkloadIdentityCredential to exchange tokens as the multi-tenant
+  # app (which has a service principal in the target tenant) rather than as
+  # the UAMI (which does not). See docs/azure-setup.md for the full explanation.
+  # TODO: Replace <MULTI_TENANT_APP_CLIENT_ID> with the Entra app client ID.
+  AZURE_CLIENT_ID: "<APP_CLIENT_ID>"
+
+  # Target tenant ID (where the storage account lives). This overrides the
+  # AZURE_TENANT_ID injected by the workload identity webhook (which always
+  # uses the source/home tenant). The SDK must request tokens scoped to the
+  # target tenant so the multi-tenant app's SP in that tenant can be used for
+  # RBAC. The webhook skips injection when the env var already exists in the
+  # container spec — see deployment.yaml for the explicit reference.
+  # TODO: Replace <TARGET_TENANT_ID> with the tenant ID where the storage account lives.
+  AZURE_TENANT_ID: "<TARGET_TENANT_ID>"

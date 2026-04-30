@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: setup-config
+  namespace: aks-xtenant-auth
+data:
+  # TODO: Replace <MULTI_TENANT_APP_CLIENT_ID> with the client ID of the
+  # multi-tenant Entra app registration created by Bishop.
+  # Find this value in docs/azure-setup.md under "App Registration → Client ID".
+  AZURE_CLIENT_ID: "<MULTI_TENANT_APP_CLIENT_ID>"
+
+  # The base URI used as the OAuth redirect target during the PKCE flow.
+  # For local access via kubectl port-forward, localhost:8081 is correct.
+  # TODO: If you are exposing the setup pod via a LoadBalancer or Ingress,
+  # change this to your external URL. See docs/azure-setup.md for instructions.
+  SETUP_REDIRECT_BASE_URI: "http://localhost:8081"
+
+  # Path where the setup wizard writes its SQLite database.
+  # Must match the volumeMount mountPath in setup-deployment.yaml.
+  SETUP_DB_PATH: "/data/setup.db"
+
+  # Port the setup wizard HTTP server binds to.
+  # Must match EXPOSE in Dockerfile.setup and containerPort in setup-deployment.yaml.
+  SETUP_PORT: "8081"

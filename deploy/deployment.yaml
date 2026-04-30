@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: timestampwriter
+  namespace: aks-xtenant-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: timestampwriter
+  template:
+    metadata:
+      labels:
+        app: timestampwriter
+        # This label is required by the AKS Workload Identity mutating webhook.
+        # When the webhook sees it, it injects AZURE_CLIENT_ID, AZURE_TENANT_ID,
+        # and AZURE_FEDERATED_TOKEN_FILE, and mounts the projected service account
+        # token. Without this label the pod gets no Azure identity.
+        azure.workload.identity/use: "true"
+      annotations:
+        # Opts this pod into AKS Identity Bindings mode. The webhook injects
+        # AZURE_KUBERNETES_TOKEN_PROXY and related proxy TLS env vars in addition
+        # to the standard workload identity env vars. The Identity Binding OIDC
+        # issuer URL (stable across clusters for the same UAMI) is used as the
+        # FIC issuer on the multi-tenant Entra app, reducing the FIC count from
+        # one-per-cluster to one-per-UAMI. See docs/azure-setup.md for details.
+        azure.workload.identity/use-identity-binding: "true"
+    spec:
+      # The ServiceAccount must be annotated with the managed identity client ID
+      # so the webhook knows which identity to project into this pod.
+      serviceAccountName: timestampwriter
+
+      containers:
+        - name: timestampwriter
+          # TODO: Replace <YOUR_ACR> with the name of your Azure Container Registry.
+          # Find this value in docs/azure-setup.md under "Container Registry".
+          # Example: myregistry.azurecr.io/timestampwriter:latest
+          image: <ACR_NAME>.azurecr.io/timestampwriter:latest
+          imagePullPolicy: Always
+
+          # Non-secret config from ConfigMap. The workload identity webhook
+          # injects AZURE_CLIENT_ID, AZURE_TENANT_ID, and
+          # AZURE_FEDERATED_TOKEN_FILE automatically — do not set those here.
+          envFrom:
+            - configMapRef:
+                name: timestampwriter-config
+
+          env:
+            # Override the UAMI client ID injected by the workload identity
+            # webhook with the multi-tenant Entra app's client ID. The
+            # ServiceAccount annotation still uses the UAMI client ID (required
+            # for Identity Binding RBAC), but this env var override ensures
+            # WorkloadIdentityCredential exchanges tokens as the multi-tenant
+            # app — which has a service principal in the target tenant and can
+            # access cross-tenant Azure Blob Storage.
+            # Value sourced from timestampwriter-config ConfigMap.
+            - name: AZURE_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: timestampwriter-config
+                  key: AZURE_CLIENT_ID
+            # Override the source-tenant AZURE_TENANT_ID injected by the
+            # workload identity webhook. The webhook injects this from the
+            # ServiceAccount annotation (always the home/source tenant). For
+            # cross-tenant storage access the SDK must request tokens scoped
+            # to the target tenant where the storage account and its SP live.
+            # The webhook skips injection when the env var is already present.
+            - name: AZURE_TENANT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: timestampwriter-config
+                  key: AZURE_TENANT_ID
+            # Path to the SQLite database written by the setup wizard.
+            # The timestampwriter reads the latest consent row from this DB
+            # to discover the target storage account and container name.
+            # Must match SETUP_DB_PATH in setup-configmap.yaml.
+            - name: SETUP_DB_PATH
+              value: "/data/setup.db"
+
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem is intentionally NOT set here.
+            # modernc.org/sqlite (pure-Go SQLite driver) writes temp files to
+            # the OS temp directory (/tmp) even when opening the DB read-only.
+            # A read-only root filesystem blocks those writes and causes the
+            # driver to fail. The remaining controls (runAsNonRoot,
+            # allowPrivilegeEscalation: false, drop ALL capabilities,
+            # RuntimeDefault seccomp) still provide strong defence-in-depth.
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            # Shared persistent volume written by the setup wizard.
+            # The timestampwriter opens setup.db read-only on each tick to
+            # discover the target storage account once the admin completes setup.
+            - name: setup-db
+              mountPath: /data
+
+      volumes:
+        - name: setup-db
+          persistentVolumeClaim:
+            claimName: setup-db
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault

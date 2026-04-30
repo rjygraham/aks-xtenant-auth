@@ -1,0 +1,29 @@
+{{define "configure.html"}}
+{{template "header" .}}
+
+<div class="success-icon">✅</div>
+<h1>Admin Consent Granted</h1>
+<h2>Consent was granted for tenant <code>{{.TenantID}}</code></h2>
+
+<p>Enter your storage account details below to complete setup.</p>
+
+<form method="POST" action="/configure">
+  <input type="hidden" name="tenant_id" value="{{.TenantID}}">
+
+  <label for="resource_id">Storage Account Resource ID</label>
+  <input type="text" id="resource_id" name="resource_id" required
+    placeholder="/subscriptions/xxxxxxxx/resourceGroups/my-rg/providers/Microsoft.Storage/storageAccounts/myaccount">
+  <p style="font-size:0.8rem;color:#605e5c;margin-top:4px;">
+    Find this in the Azure Portal → Storage account → Properties → Resource ID.
+  </p>
+
+  <label for="container_name">Container Name</label>
+  <input type="text" id="container_name" name="container_name" required placeholder="timestamps">
+
+  <div class="form-actions">
+    <button type="submit" class="btn">Save &amp; View Setup Commands</button>
+  </div>
+</form>
+
+{{template "footer" .}}
+{{end}}

@@ -1,0 +1,61 @@
+# =============================================================================
+# Dockerfile.setup — Setup Wizard
+#
+# This is a SEPARATE Dockerfile from the root Dockerfile (which builds
+# cmd/timestampwriter). It exists here because:
+#   - Different binary: cmd/setup vs cmd/timestampwriter
+#   - Different image: shipped to a different ACR tag
+#   - Different deployment lifecycle: the setup wizard is ephemeral (run once
+#     to configure the tenant, then scale to 0 or delete). The timestamp writer
+#     is a long-running workload. Keeping them as separate images means you can
+#     build, version, and deploy them independently without coupling their
+#     release cycles.
+# =============================================================================
+
+# =============================================================================
+# Stage 1 — builder
+# Purpose: Compile the Go binary in a full Go toolchain environment.
+#          This stage is discarded after build; nothing here reaches prod.
+# =============================================================================
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+
+# Copy dependency manifests first so Docker cache is reused when only source changes.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source tree.
+COPY . .
+
+# Build a statically-linked binary (CGO_ENABLED=0) so it runs in the
+# distroless final image, which has no libc or shell.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+    -o /setup ./cmd/setup
+
+# =============================================================================
+# Stage 2 — runtime
+# Purpose: Minimal, non-root, read-only image for the setup wizard.
+#
+# Choice: gcr.io/distroless/static-debian12:nonroot
+#   - No shell, no package manager, no libc — drastically reduces attack surface.
+#   - The :nonroot tag sets UID/GID 65532, satisfying runAsNonRoot in K8s.
+#   - "static-debian12" is appropriate for CGO_ENABLED=0 Go binaries with no
+#     system library dependencies.
+#   - This wizard handles OAuth PKCE callbacks — keeping the image surface
+#     minimal reduces the blast radius if a dependency is ever compromised.
+# =============================================================================
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# Copy only the compiled binary from the builder stage.
+COPY --from=builder /setup /setup
+
+# The setup wizard serves the PKCE flow on port 8081.
+# This must match SETUP_PORT in the ConfigMap and containerPort in the Deployment.
+EXPOSE 8081
+
+# UID/GID 65532 is provided by the :nonroot distroless tag.
+# Explicitly declared here so the intent is obvious to reviewers.
+USER nonroot:nonroot
+
+ENTRYPOINT ["/setup"]

@@ -1,0 +1,23 @@
+{
+  "universe_usage_history": [
+    {
+      "universe": "Alien",
+      "assignment_date": "2026-04-29",
+      "project": "rjygraham_aks_xtenant_auth"
+    }
+  ],
+  "assignment_cast_snapshots": {
+    "2026-04-29-initial": {
+      "assignment_id": "2026-04-29-initial",
+      "universe": "Alien",
+      "project": "rjygraham_aks_xtenant_auth",
+      "cast": {
+        "ripley": "Lead / Architect",
+        "dallas": "Go Developer",
+        "bishop": "Azure Engineer",
+        "hudson": "DevOps",
+        "vasquez": "Tester"
+      }
+    }
+  }
+}

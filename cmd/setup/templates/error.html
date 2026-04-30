@@ -1,0 +1,24 @@
+{{define "error.html"}}
+{{template "header" .}}
+
+<div class="error-icon">⚠️</div>
+<h1>Consent Failed</h1>
+<h2>Admin consent could not be completed</h2>
+
+<div class="error-msg">
+  <strong>{{.Error}}</strong>{{if .ErrorDescription}}<br>{{.ErrorDescription}}{{end}}
+</div>
+
+<p>Common causes include:</p>
+<ul>
+  <li>Admin consent was declined or cancelled</li>
+  <li>The user does not have the required admin role in the tenant</li>
+  <li>The session cookie expired before the consent flow completed</li>
+</ul>
+
+<hr class="divider">
+
+<p><a href="/" class="btn btn-outline">← Try Again</a></p>
+
+{{template "footer" .}}
+{{end}}

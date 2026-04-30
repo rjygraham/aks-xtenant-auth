@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: setup
+  namespace: aks-xtenant-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: setup
+  template:
+    metadata:
+      labels:
+        app: setup
+        # NOTE: azure.workload.identity/use: "true" is intentionally ABSENT here.
+        # The setup wizard uses delegated auth (the admin's own PKCE token via
+        # the browser flow), NOT AKS workload identity / pod identity.
+        # Adding this label would cause the webhook to inject managed identity
+        # credentials that the setup wizard neither needs nor should have.
+        # Do not add the workload identity label.
+    spec:
+      # The setup wizard does not need a custom ServiceAccount with workload
+      # identity annotations — it carries no Azure pod identity of its own.
+      # The default ServiceAccount is sufficient.
+
+      containers:
+        - name: setup
+          # TODO: Replace <YOUR_ACR> with the name of your Azure Container Registry.
+          # Find this value in docs/azure-setup.md under "Container Registry".
+          # Example: myregistry.azurecr.io/aks-xtenant-setup:latest
+          image: <YOUR_ACR>.azurecr.io/aks-xtenant-setup:latest
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8081
+              name: http
+
+          # All non-secret config is sourced from the setup-config ConfigMap.
+          # AZURE_CLIENT_ID here is the multi-tenant app's client ID used for
+          # the PKCE delegated auth flow — it is NOT injected by the workload
+          # identity webhook (which is why it lives in a ConfigMap instead).
+          envFrom:
+            - configMapRef:
+                name: setup-config
+
+          env:
+            # Path where modernc.org/sqlite will write the setup wizard database.
+            # Hardcoded here to match the volumeMount mountPath below (/data).
+            - name: SETUP_DB_PATH
+              value: "/data/setup.db"
+
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem is intentionally NOT set here.
+            # modernc.org/sqlite (pure-Go SQLite driver) writes temp files to
+            # the OS temp directory (typically /tmp) during query execution.
+            # Even though /data is writable via a volume mount, a read-only
+            # root filesystem blocks writes to /tmp entirely, causing the driver
+            # to fail. Removing this flag accepts a slightly wider root FS write
+            # surface in exchange for a working SQLite connection. The remaining
+            # controls (runAsNonRoot, allowPrivilegeEscalation: false, drop ALL
+            # capabilities, RuntimeDefault seccomp) still provide strong
+            # defence-in-depth.
+            capabilities:
+              drop:
+                - ALL
+
+          # No liveness or readiness probes.
+          # The setup wizard is a short-lived, ephemeral tool meant to be run
+          # once by an admin and then scaled down or deleted. Probe overhead and
+          # restart logic add complexity with no operational benefit here.
+
+          volumeMounts:
+            # Persistent volume for the SQLite database.
+            # The setup wizard writes /data/setup.db; this mount survives pod restarts.
+            - name: setup-db
+              mountPath: /data
+
+      volumes:
+        - name: setup-db
+          persistentVolumeClaim:
+            claimName: setup-db
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault

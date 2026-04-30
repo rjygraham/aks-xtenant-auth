@@ -1,0 +1,25 @@
+{{define "index.html"}}
+{{template "header" .}}
+
+<h1>Cross-Tenant Storage Access</h1>
+<h2>Admin consent wizard for external tenant administrators</h2>
+
+<p>
+  This wizard registers the AKS workload identity application in <strong>your</strong> Azure tenant,
+  allowing a Kubernetes workload running in a separate tenant to write blobs to a Storage account you control.
+</p>
+
+<p><strong>Who should run this:</strong> a Global Administrator or Application Administrator in the target tenant.</p>
+
+<p>
+  Clicking the button below will redirect you to Microsoft's admin consent page. After you approve,
+  you will be returned here with next steps — including the <code>az role assignment create</code>
+  command to grant the service principal access to your storage account.
+</p>
+
+<hr class="divider">
+
+<p><a href="/start-consent" class="btn">Grant Admin Consent →</a></p>
+
+{{template "footer" .}}
+{{end}}

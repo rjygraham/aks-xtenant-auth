@@ -1,0 +1,43 @@
+{{define "success.html"}}
+{{template "header" .}}
+
+<div class="success-icon">✅</div>
+<h1>Configuration Saved</h1>
+<h2>Storage account details saved for tenant <code>{{.TenantID}}</code></h2>
+
+<p>Complete the two steps below to finish deployment.</p>
+
+<hr class="divider">
+
+<h3 style="margin-bottom:10px;font-size:1rem;">Step 1 — Assign the Storage Blob Data Contributor role</h3>
+<p style="font-size:0.9rem;">Run this command in Azure CLI:</p>
+
+<div class="code-block">az role assignment create \
+  --assignee-object-id $(az ad sp show --id {{.ClientID}} --query id -o tsv) \
+  --role "Storage Blob Data Contributor" \
+  --scope {{.ResourceID}} \
+  --assignee-principal-type ServicePrincipal</div>
+
+<p style="font-size:0.85rem;color:#605e5c;margin-top:8px;">
+  Run this command while logged into the <em>target</em> tenant (<code>{{.TenantID}}</code>)
+  with an account that has Owner or User Access Administrator on the storage account.
+  The timestamp writer will automatically begin writing once the role assignment propagates.
+</p>
+
+<hr class="divider">
+
+<h3 style="margin-bottom:10px;font-size:1rem;">Step 2 — Update the AKS workload identity annotations</h3>
+<p style="font-size:0.9rem;">Edit <code>deploy/serviceaccount.yaml</code> with your app registration details:</p>
+
+<div class="code-block">azure.workload.identity/client-id: "{{.ClientID}}"
+azure.workload.identity/tenant-id: "{SOURCE_TENANT_ID}"</div>
+
+<p style="font-size:0.85rem;color:#605e5c;">
+  <code>azure.workload.identity/tenant-id</code> is the <em>source</em> tenant where the app registration
+  lives — not <code>{{.TenantID}}</code>.<br>
+  The timestamp writer reads storage account configuration directly from the shared database —
+  no changes to <code>deploy/configmap.yaml</code> are required.
+</p>
+
+{{template "footer" .}}
+{{end}}

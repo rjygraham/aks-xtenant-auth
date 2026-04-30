@@ -1,0 +1,24 @@
+# ClusterRole for AKS Identity Bindings.
+#
+# This RBAC rule authorizes the timestampwriter ServiceAccount to use the
+# specified User-Assigned Managed Identity (UAMI) via the AKS Identity
+# Bindings feature. The Identity Bindings webhook checks for this permission
+# before injecting the proxy environment variables into the pod.
+#
+# The resource name in the rule MUST equal the UAMI's client ID — this is
+# how the webhook determines which managed identity is being requested.
+#
+# TODO: Replace <UAMI_CLIENT_ID> with the UAMI client ID from
+# docs/azure-setup.md Step 2 — in BOTH the metadata.name and
+# the rules[].resources[] fields.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  # Convention: name must include the UAMI client ID so multiple UAMIs can
+  # coexist on the same cluster without ClusterRole name collisions.
+  name: use-mi-<UAMI_CLIENT_ID>
+rules:
+  - verbs: ["use-managed-identity"]
+    apiGroups: ["cid.wi.aks.azure.com"]
+    # The resource name MUST be the exact UAMI client ID.
+    resources: ["<UAMI_CLIENT_ID>"]

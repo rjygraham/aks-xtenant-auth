@@ -1,0 +1,21 @@
+# ClusterRoleBinding for AKS Identity Bindings.
+#
+# Binds the timestampwriter ServiceAccount to the ClusterRole that grants
+# permission to use the UAMI. This is required for the Identity Bindings
+# webhook to inject proxy credentials into timestampwriter pods.
+#
+# TODO: Replace <UAMI_CLIENT_ID> in roleRef.name with the UAMI client ID
+# from docs/azure-setup.md Step 2 (must match deploy/clusterrole.yaml).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: timestampwriter-identity-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  # Must match the ClusterRole name in deploy/clusterrole.yaml
+  name: use-mi-<UAMI_CLIENT_ID>
+subjects:
+  - kind: ServiceAccount
+    name: timestampwriter
+    namespace: aks-xtenant-auth

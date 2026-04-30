@@ -1,0 +1,29 @@
+# Apply order: namespace → setup-pv → setup-pvc → setup-configmap → setup-deployment → setup-service
+#
+# NOTE: This PVC binds to the static PersistentVolume defined in setup-pv.yaml.
+# We use static provisioning with Azure Files NFS rather than dynamic provisioning
+# because the subscription Azure Policy enforces allowSharedKeyAccess: false on all
+# storage accounts. The CIFS protocol (used by azurefile-csi dynamic provisioning)
+# requires key-based authentication, which is permanently blocked. NFS does not use
+# key auth — it uses network-level access control (VNet service endpoint + VNet rule).
+# See setup-pv.yaml for the static PV configuration and docs/azure-setup.md for the
+# full networking prerequisites.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: setup-db
+  namespace: aks-xtenant-auth
+spec:
+  accessModes:
+    # ReadWriteMany is required so both the setup wizard pod and the
+    # timestampwriter pod can mount this volume simultaneously.
+    # Azure Files NFS supports ReadWriteMany; Azure Disk does not.
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  # Empty string binds to the static PV (setup-db-nfs) defined in setup-pv.yaml.
+  # Static provisioning is required for NFS shares — the dynamic azurefile-csi
+  # class uses CIFS by default and cannot be overridden to NFS in this environment.
+  storageClassName: ""
+  volumeName: setup-db-nfs

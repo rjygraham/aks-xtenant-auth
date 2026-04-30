@@ -1,0 +1,54 @@
+# Apply order: namespace → setup-pv → setup-pvc → setup-configmap → setup-deployment → setup-service
+#
+# Static PersistentVolume backed by an Azure Files NFS share.
+#
+# WHY STATIC PROVISIONING + NFS:
+# The subscription enforces an Azure Policy that sets allowSharedKeyAccess: false
+# on all storage accounts. The CIFS protocol (used by azurefile-csi dynamic
+# provisioning) authenticates with the storage account key and is therefore
+# permanently blocked. NFS v4.1 uses network-level access control instead —
+# the AKS node subnet is whitelisted on the storage account, and NFS traffic
+# is routed over the Azure backbone via the Microsoft.Storage service endpoint.
+# No storage account key is exchanged at mount time.
+#
+# PREREQUISITES (one-time Azure setup — see docs/azure-setup.md Step 2c):
+#   1. Microsoft.Storage service endpoint added to subnet <AKS_NODE_SUBNET_NAME>
+#      in VNet <AKS_VNET_NAME> (resource group <NFS_RESOURCE_GROUP>).
+#   2. NSG rule Allow-NFS-Outbound (priority 110, TCP port 2049 outbound to
+#      Storage.<LOCATION>) added to <AKS_NODE_NSG_NAME>.
+#   3. Storage account <NFS_STORAGE_ACCOUNT> (Premium_LRS, FileStorage kind,
+#      https-only: false) created in <NFS_RESOURCE_GROUP>.
+#   4. VNet rule added to <NFS_STORAGE_ACCOUNT> allowing <AKS_NODE_SUBNET_NAME>.
+#   5. NFS file share "setup-db" created in <NFS_STORAGE_ACCOUNT> via ARM
+#      (az storage share-rm create --enabled-protocols NFS).
+#
+# STORAGE: Premium_LRS minimum is 100 GiB for NFS shares.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: setup-db-nfs
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  # Retain keeps the Azure Files share and its data even if the PVC is deleted.
+  # This prevents accidental data loss during redeployments. To clean up,
+  # delete this PV manually and then delete the Azure Files share directly.
+  persistentVolumeReclaimPolicy: Retain
+  # Empty string means this PV is not managed by any StorageClass — it is
+  # statically provisioned and must be explicitly claimed by the PVC.
+  storageClassName: ""
+  csi:
+    driver: file.csi.azure.com
+    # volumeHandle must be globally unique within the cluster. Using a descriptive
+    # path-style identifier keeps it readable and avoids collisions.
+    volumeHandle: <NFS_RESOURCE_GROUP>#<NFS_STORAGE_ACCOUNT>#setup-db###<K8S_NAMESPACE>
+    readOnly: false
+    volumeAttributes:
+      # NFS protocol — does NOT use storage account key auth.
+      protocol: nfs
+      storageAccount: <NFS_STORAGE_ACCOUNT>
+      shareName: setup-db
+      subscriptionID: "<SOURCE_SUBSCRIPTION_ID>"
+      resourceGroup: <NFS_RESOURCE_GROUP>
