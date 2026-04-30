@@ -31,3 +31,18 @@
 - **Recommendation: Hold on migration until Bishop confirms feasibility AND FIC limit increase is denied by Azure Support.** Current architecture is proven and stable. Only migrate if FIC limit becomes urgent blocker.
 - **Prioritized change list created (10 items):** All contingent on Bishop's identity chain redesign. Scope serves as blueprint if migration becomes necessary.
 
+### 2026-04-29 — Confused Deputy Architectural Security Review
+
+- **Verdict: Architecture is NOT susceptible to confused deputy.** The two-client-ID pattern (UAMI for IB RBAC, Entra app for cross-tenant token exchange) is intentional defense-in-depth, not a vulnerability.
+- **Key insight: Separation of identities REDUCES attack surface.** UAMI has no cross-tenant capability; Entra app has no source-tenant RBAC. Neither identity alone can complete the full attack chain.
+- **Identity Bindings improves security posture vs. standard workload identity.** The ClusterRole/ClusterRoleBinding becomes an explicit Kubernetes-level authorization checkpoint before the webhook injects credentials. Standard workload identity lacks this gate.
+- **Blast radius analysis:** Pod-level RCE is limited to blob writes on one container. Namespace admin can't escalate (Entra app SP has no RBAC elsewhere). Cluster operator and subscription owner trust is assumed.
+- **No design changes required.** Optional hardening: OPA policy on ConfigMap, Azure Policy on SP RBAC, Defender for Storage. These are belt-and-suspenders, not fixes.
+- **Safe to present as a secure pattern** for cross-tenant authentication demonstrations.
+
+### 2026-04-30 — Confused Deputy Analysis Complete
+
+- **Delivered complete architectural security review.** Six attack vectors analyzed (pod impersonation, token exfiltration, ConfigMap modification, FIC cross-SA acceptance, RBAC over-scoping, two-client-ID pattern).
+- **Production architecture verdict: LOW-MEDIUM RISK.** Well-defended on identity chain; unmitigated RBAC over-scoping at RG level (should narrow to container scope). Documentation contained errors (fixed by Bishop in commit 29d85c1).
+- **Concurrent Bishop analysis confirmed.** 6-vector threat model matches architectural review findings.
+- **Decision merged into primary decisions.md entry.**
