@@ -65,3 +65,14 @@
 - **`readOnlyRootFilesystem: false` on both pods** is an accepted trade-off documented in the manifests (modernc.org/sqlite writes to /tmp). Remaining controls (non-root, drop ALL caps, RuntimeDefault seccomp) maintain meaningful depth.
 - **No liveness probe on timestampwriter** — operational gap, not security gap. A hung write loop is invisible to Kubernetes.
 - **Priority fixes documented in `.squad/decisions/inbox/ripley-security-audit.md`** (7 items, 4 code/manifest changes).
+
+### 2026-04-30 — AWS + Azure Dual-Cloud Feasibility (DECISION)
+
+- **VERDICT: YES — feasible.** Dual-cloud access from single AKS pod requires **two separately projected service account tokens** with different audiences (not single token).
+- **Recommended Architecture: Option B1.** IB token for Azure (existing, proven path); cluster OIDC token for AWS (GA Kubernetes mechanism). Both tokens mount simultaneously in pod without conflict.
+- **Why single token fails:** Azure requires `aud: api://AKSIdentityBinding`; AWS requires `aud: sts.amazonaws.com`. Technically possible to couple both clouds to one audience, but violates least privilege and architecturally unsound.
+- **Kubernetes v1.21+ supports multiple projected SA token volumes** with different audiences. IB webhook injects only its volume; does not block manually-declared projected volumes. No webhook conflict.
+- **Blast radius analysis:** Pod RCE expands from one Azure container to all AWS resources accessible via IAM role. Mitigated by least-privilege AWS IAM policy, strict trust policy conditions on SA subject, existing NetworkPolicy allows HTTPS egress. Optional: separate pods for Azure/AWS (defense-in-depth).
+- **Implementation steps:** Register AKS cluster OIDC issuer in AWS IAM, create AWS IAM role with trust policy scoped to SA subject + `sts.amazonaws.com` audience, attach least-privilege policy, add second projected volume, configure env vars, add `aws-sdk-go-v2` dependency.
+- **What does NOT change:** IB binding configuration, Azure cross-tenant flow, existing RBAC manifests, existing NetworkPolicy.
+- **Decision merged into primary decisions.md.**

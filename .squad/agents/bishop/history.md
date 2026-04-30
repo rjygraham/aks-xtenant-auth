@@ -61,3 +61,15 @@
 
 **Severity:** Low (no action taken; decision log is authoritative). Indicates this topic requires extra clarity in future documentation or training.
 
+### 2026-04-30 — IB OIDC Token Mechanics and AWS IAM Federation (ANALYSIS)
+
+- **Critical Finding: Pod never holds token with IB OIDC issuer.** IB proxy **re-signs** cluster's standard OIDC token when exchanging with Entra. Pod's token file always carries cluster OIDC issuer (`https://oidc.prod-aks.azure.com/<cluster-guid>/`). IB OIDC issuer (`ib.oic.prod-aks.azure.com`) is internal proxy infrastructure.
+- **Implication for AWS:** Registering IB OIDC issuer in AWS IAM is mechanically possible (JWKS endpoint is public) but irrelevant because pod never holds token with that issuer.
+- **Audience mismatch blocks single-token approach.** Azure FIC requires `aud: api://AKSIdentityBinding`; AWS IAM requires `aud: sts.amazonaws.com`. IB webhook projects single audience. Separate tokens required.
+- **Two-volume architecture confirmed viable.** IB webhook is mutating admission controller that appends volume; does not block other volumes. Kubernetes projects both tokens independently, renewed independently, no conflict.
+- **Per-cluster AWS OIDC registration required.** Each cluster has unique OIDC issuer; AWS IAM needs one registered OIDC IdP per issuer. For N clusters: N registrations in AWS. AWS IAM role trust policies support multiple conditions (4096-char limit, expandable).
+- **Azure FIC count problem NOT reintroduced.** Azure side unchanged; IB handles FIC scaling. Separate per-cluster burden exists on AWS side (different infrastructure, no per-role FIC equivalent).
+- **Security boundary expanded.** Dual-cloud pod blast radius includes all AWS resources accessible via IAM role (vs. single Azure container). Token files co-located in pod. Lateral movement risk: exfiltrated AWS token callable from outside pod. Containment: least-privilege AWS IAM role, consider pod separation (separate SA, RBAC, NetworkPolicy).
+- **IB preview open questions:** JWKS format conformance to AWS IdP requirements (unverified); webhook idempotency on volume name conflicts (test required); cross-cluster Entra app FIC issuer does not benefit from single-FIC-per-UAMI promise (pre-existing constraint).
+- **Recommendation:** Use cluster OIDC token for AWS (second projected volume), register each cluster issuer in AWS IAM, scope AWS IAM role tightly, consider pod separation if containment critical, document combined credential model.
+- **Decision merged into primary decisions.md.**

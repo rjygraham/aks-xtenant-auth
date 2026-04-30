@@ -112,3 +112,154 @@ The dual-client-ID pattern + defense-in-depth K8s RBAC + Azure RBAC creates a ti
 **Verdict:** Safe to present as a secure pattern. Design implements least privilege, explicit delegation, token audience validation, and defense-in-depth.
 
 ---
+
+## 2026-04-30: AWS + Azure Dual-Cloud Feasibility via AKS Identity Bindings (DECISION)
+
+### Decision Summary
+
+**YES — it is feasible.** The timestampwriter pod can authenticate to both a cross-tenant Azure environment AND an AWS environment simultaneously from the same AKS cluster using Identity Bindings. However, it **cannot be done with a single projected token**. The viable path requires **two separately projected service account tokens** with different audiences.
+
+### Verdict
+
+**Recommended Architecture: Option B1 — IB Token for Azure + Cluster OIDC Token for AWS**
+
+- Use IB-injected token (`api://AKSIdentityBinding` audience, IB OIDC issuer) for cross-tenant Azure access (existing proven path)
+- Add manually-projected token (`sts.amazonaws.com` audience, cluster OIDC issuer) for AWS access (GA Kubernetes mechanism)
+- Both tokens coexist in the pod without conflict; kubelet renews independently
+
+### Key Technical Findings
+
+**Can IB OIDC Issuer Be Registered in AWS?**
+- Technically yes: issuer URL is HTTPS, exposes public JWKS endpoint, `iss` claim matches issuer exactly
+- Practically irrelevant: pod never holds a token with IB issuer (`ib.oic.prod-aks.azure.com`); that's an internal proxy layer
+- Bishop finding: pod's token file always carries cluster OIDC issuer, never IB issuer; IB issuer only appears in Entra FIC exchange
+
+**Token Audience Conflict (Why Single Token Won't Work)**
+- Azure requires `aud: api://AKSIdentityBinding`; AWS requires `aud: sts.amazonaws.com`
+- Single JWT has one `aud` value; technically possible to make both clouds accept `api://AKSIdentityBinding` but creates architecture coupling
+- Verdict: architecturally unsound; two separate tokens is cleaner
+
+**Kubernetes Projected Volume Support**
+- v1.21+ supports multiple `serviceAccountToken` projections simultaneously with different audiences
+- IB webhook only injects its volume; does not block additional manually-declared projected volumes
+- No conflict; both volumes exist and are renewed independently by kubelet
+
+**SDK Environment Variable Conflicts**
+- Azure SDK: `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
+- AWS SDK: `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_REGION`, `AWS_ROLE_SESSION_NAME`
+- No collision; both SDKs operate independently on different env vars and file paths
+
+**Blast Radius / Security Analysis**
+- Current (Azure only): pod RCE = blob writes to one cross-tenant container
+- Dual-cloud: pod RCE = blob writes + all AWS permissions granted to IAM role
+- Mitigations: least-privilege AWS IAM policy, strict trust policy conditions on SA subject/audience, existing NetworkPolicy allows HTTPS egress
+- Recommendation: if blast radius is critical concern, use separate pods for Azure and AWS workloads
+
+### Action Items
+
+**Immediate (If Pursuing Dual-Cloud):**
+1. Register AKS cluster OIDC issuer in AWS IAM as Identity Provider
+2. Create AWS IAM role with trust policy scoped to SA subject (`system:serviceaccount:aks-xtenant-auth:timestampwriter`) and `sts.amazonaws.com` audience
+3. Attach least-privilege policy to AWS IAM role (e.g., `s3:PutObject` on specific bucket/prefix only)
+4. Add second projected volume to deployment with `sts.amazonaws.com` audience at custom path
+5. Configure env vars in ConfigMap: `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_REGION`
+6. Add `aws-sdk-go-v2` dependency and implement AWS write path in timestampwriter
+
+**Security Hardening:**
+- Document combined credential containment model
+- Consider adding `aws-events` events to existing Defender for Storage
+- If pod compromise is high-risk: separate Azure and AWS into different pods with different ServiceAccounts (defense-in-depth)
+
+### What Does NOT Change
+
+- IB identity binding configuration
+- Azure cross-tenant token flow
+- Existing RBAC manifests
+- Existing NetworkPolicy (HTTPS egress already permitted)
+
+### Evidence
+
+- Ripley analysis: dual-cloud architecture is feasible; recommended Option B1 (IB for Azure + cluster OIDC for AWS)
+- Bishop analysis: token mechanics verified; pod never holds IB-issuer token; second projected volume operates independently
+- Both findings validated against Kubernetes v1.21+ specs and Azure/AWS IAM federation models
+
+---
+
+## 2026-04-29: IB OIDC Token Mechanics and AWS IAM Federation (ANALYSIS)
+
+### Analysis Summary
+
+**Technical Background: IB Token Flows**
+
+The pod never holds a token whose `iss` claim is the IB OIDC issuer (`https://ib.oic.prod-aks.azure.com/<TENANT>/<CLIENT_ID>/`). The IB OIDC issuer is internal to the IB proxy infrastructure — it's the stable issuer presented to Entra when the proxy mediates token exchange. The pod's own token file (at `AZURE_FEDERATED_TOKEN_FILE`) always carries the cluster standard OIDC issuer (`https://oidc.prod-aks.azure.com/<cluster-guid>/`).
+
+**Key Findings on IB OIDC Issuer for AWS**
+
+1. **Mechanically possible to register IB issuer in AWS IAM,** but irrelevant — pod doesn't hold that issuer
+2. **IB OIDC JWKS endpoint is public** (required for Entra validation), so AWS IAM OIDC IdP registration is mechanically possible
+3. **Audience mismatch blocks it anyway:** IB tokens carry `aud: api://AKSIdentityBinding`; AWS requires `aud: sts.amazonaws.com`
+4. **IB JWKS conformance to AWS IdP requirements is undocumented for preview feature** — unverified whether response format matches AWS expectations
+
+**Verdict:** IB OIDC issuer cannot be the practical mechanism for AWS federation from this pod.
+
+### Projected Token Mechanics
+
+**Can pod spec include both IB-injected volume and second manually-declared projected volume?**
+- Yes: IB webhook is mutating admission hook that appends volume; doesn't remove or lock other volumes
+- No conflict: both tokens projected independently by kubelet, renewed independently, read from different file paths
+- IB webhook only operates on pod annotation `azure.workload.identity/use-identity-binding: "true"` and injects exactly its volume
+
+**Architecture Result**
+```
+AKS Pod
+├─ Volume: azure-identity-token  (aud: api://AKSIdentityBinding, iss: cluster OIDC)
+│   └─ → IB Proxy → re-signs with IB OIDC issuer → Entra UAMI FIC → cross-tenant access
+└─ Volume: aws-identity-token    (aud: sts.amazonaws.com, iss: cluster OIDC)
+    └─ → AWS STS AssumeRoleWithWebIdentity → AWS IAM role → AWS resources
+```
+
+### Per-Cluster Registration Burden
+
+**Does dual-cloud reintroduce the FIC limit problem IB was designed to solve?**
+- Azure side: **No.** IB token path unchanged; one UAMI FIC per Entra app; FIC count doesn't grow with clusters
+- AWS side: **Yes — per-cluster OIDC provider registration required**, but in AWS IAM (not Entra)
+- Each cluster has unique OIDC issuer → AWS IAM needs N registered OIDC IdP entries for N clusters
+- AWS IAM role trust policies can reference multiple OIDC conditions (4096-char limit, expandable via support)
+- Different infrastructure scaling problem on AWS side; no documented per-role FIC equivalent
+
+**Key Distinction:** The Azure FIC count problem is NOT reintroduced; separate per-cluster burden exists on AWS side instead.
+
+### Security Boundary Analysis
+
+**Blast Radius Expansion**
+- Current: cross-tenant Azure Blob Storage (single container), source UAMI (NetworkPolicy blocks IMDS)
+- With AWS: all of above PLUS all AWS resources accessible via assumed IAM role
+- Both cloud credentials co-located in same pod — container escape or volume abuse grants both simultaneously
+
+**Specific Concerns:**
+1. Shared token file exposure — any process in pod can read both files
+2. NetworkPolicy: current HTTPS egress to `0.0.0.0/0` already allows AWS STS; no new egress rule needed
+3. Blast-radius asymmetry — AWS role permissions determine combined scope; could vastly exceed Azure-side scope
+4. Lateral movement — exfiltrated AWS token valid up to `expirationSeconds`; can call AssumeRoleWithWebIdentity from outside cluster
+
+**Containment Recommendations:**
+- AWS IAM role scoped to minimum necessary (e.g., specific S3 bucket/prefix only)
+- Consider separate pods with separate ServiceAccounts for Azure and AWS targets (separate RBAC, token lifetimes, network boundaries)
+- Document combined blast radius explicitly in security model
+
+### Open Questions for IB Preview
+
+1. **IB OIDC JWKS accessibility:** Does `https://ib.oic.prod-aks.azure.com/<TENANT>/<CLIENT_ID>/keys` pass AWS IAM IdP registration validation?
+2. **IB webhook idempotency on volume names:** If pod spec manually declares volume named `azure-identity-token` before webhook runs, does it overwrite, skip injection, or error?
+3. **Entra app FIC issuer for cross-cluster:** Existing cross-tenant Entra app FIC uses cluster OIDC issuer + `api://AKSIdentityBinding`; does NOT benefit from IB's single-FIC-per-UAMI promise — each new cluster still needs new Entra app FIC (pre-existing architecture constraint)
+
+### Recommendation
+
+If team pursues dual Azure + AWS writes:
+1. Use cluster OIDC token for AWS (second projected volume, `aud: sts.amazonaws.com`); do not reuse IB token
+2. Register each cluster's OIDC issuer in AWS IAM as separate Identity Provider
+3. Scope AWS IAM role tightly — minimum permissions to compensate for expanded blast radius
+4. Consider pod separation — separate pod for AWS writes (different SA, different network policy, no cross-tenant token) if containment is critical
+5. Update security documentation with combined credential model
+
+---
