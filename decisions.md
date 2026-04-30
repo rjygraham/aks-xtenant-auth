@@ -296,3 +296,60 @@ If team pursues dual Azure + AWS writes:
 5. Update security documentation with combined credential model
 
 ---
+
+
+## 2026-04-30: Shared UAMI for Azure and AWS Authentication Paths (DECISION)
+
+# Decision: Shared UAMI for Azure and AWS Authentication Paths
+
+**Date:** 2026-04-30  
+**Author:** Bishop (Azure Engineer)  
+**Status:** Documented — operator decision required  
+
+---
+
+## Decision Statement
+
+A single User-Assigned Managed Identity (UAMI) can serve both the cross-tenant Azure
+Blob write path (via IB → Entra multi-tenant app OBO exchange) and the AWS S3 write path
+(via IB → dedicated `api://aws-sts-audience` Azure AD JWT → `sts:AssumeRoleWithWebIdentity`).
+This is architecturally valid because both paths are independent downstream token
+exchanges from the same UAMI credential; zero UAMI configuration changes are required
+to add the AWS path.
+
+## Technical Basis
+
+- The IB proxy exchanges the cluster OIDC token for a UAMI access token. From that point,
+  the pod can call `GetToken` for any resource the UAMI has been granted app-role
+  assignments on — including both the cross-tenant Entra app and the `api://aws-sts-audience`
+  app.
+- The UAMI Object ID (`principalId`) is stable across all clusters. It is the correct
+  `sub` value for the AWS IAM trust policy. This enables a single IAM IdP registration
+  for all clusters.
+- The IB OIDC issuer is UAMI-scoped (`ib.oic.prod-aks.azure.com/<tenant>/<uami-client-id>/`),
+  so both paths share the same single FIC on the Entra app regardless of cluster count.
+
+## Trade-offs Accepted (Shared UAMI)
+
+**Accepted:**
+- One identity to provision, monitor, and audit across both clouds
+- Stable AWS `sub` — zero AWS reconfiguration when adding clusters
+- No FIC proliferation on the Entra app for either path
+
+**Accepted risks:**
+- Wider blast radius: a pod compromise exposes both Azure and AWS downstream paths
+- Coupled revocation: disabling the UAMI interrupts both paths simultaneously
+- Access reviews must span both IAM systems
+
+## Split UAMI Triggers
+
+Operators should switch to separate UAMIs when any of the following apply:
+1. The two paths operate on data of different classification levels
+2. Independent revocation is a compliance requirement
+3. The AWS IAM role has permissions beyond `s3:PutObject` on a single prefix
+4. Azure and AWS paths are owned by different teams with separate incident response
+
+## Reference
+
+See `docs/uami-shared-identity.md` for the full analysis including token flow diagrams,
+security implications, and the decision table.

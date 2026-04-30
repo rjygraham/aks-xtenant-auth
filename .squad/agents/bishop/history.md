@@ -46,6 +46,39 @@
 
 ## Learnings
 
+### 2026-04-30 — Shared UAMI: Azure + AWS Dual-Path Documentation
+
+**Work completed:** Created `docs/uami-shared-identity.md` documenting whether and how
+a single UAMI can serve both the cross-tenant Azure Blob path (IB → Entra OBO → Storage)
+and the AWS S3 path (IB → `api://aws-sts-audience` Azure AD JWT → STS).
+
+**Key documented facts:**
+
+- **Both paths are architecturally valid from a single UAMI.** The fork happens after
+  the IB proxy exchange — the pod holds a single UAMI credential and calls `GetToken`
+  independently for each target resource. No UAMI configuration changes required to add
+  the AWS path.
+- **What stays the same:** UAMI, IB webhook, pod annotation, ServiceAccount annotation,
+  ClusterRole/Binding, FIC on Entra app — identical for both paths.
+- **What changes per path:** `GetToken` resource/audience, target tenant (Azure path
+  only), downstream call (Blob SDK vs. STS + S3 SDK).
+- **Shared UAMI advantages:** Operational simplicity, stable AWS `sub` (UAMI OID,
+  not cluster OIDC), consistent IB setup, audit coherence (single identity in both
+  Azure Monitor and CloudTrail), no FIC proliferation.
+- **Shared UAMI risks:** Wider blast radius (both clouds reachable from single pod
+  compromise), coupled revocation (no partial disable), single point of failure for
+  identity infrastructure, entangled access reviews.
+- **Security nuance on confused deputy:** Three IB enforcement layers protect the UAMI
+  token acquisition. But once the IB gate is passed, no per-path gate exists on
+  downstream token exchanges — blast radius of a successful IB gate bypass is wider
+  with a shared UAMI.
+- **Split UAMI triggers:** Different data classification, compliance-required
+  independent revocation, AWS role permissions broader than `s3:PutObject` on single
+  prefix, different owning teams.
+- **Monitoring key:** UAMI Object ID is the cross-cloud correlation key for Azure
+  Monitor + CloudTrail. Separate alerts required per audience (Azure-path vs. AWS-path)
+  to avoid noise.
+
 ### 2026-04-29 — Azure & Identity Security Audit
 
 - `docs/azure-setup.md` still mixes the accepted simplified admin-consent setup with a superseded PKCE/Graph/ARM design. That drift would cause operators to add unnecessary delegated permissions, redirect URIs, and broader admin expectations.
@@ -61,7 +94,20 @@
 
 **Severity:** Low (no action taken; decision log is authoritative). Indicates this topic requires extra clarity in future documentation or training.
 
-### 2026-04-30 — IB OIDC Token Mechanics and AWS IAM Federation (ANALYSIS)
+### 2026-04-30 — AWS Option B: Azure AD as Stable OIDC Provider for AWS
+
+**Work completed:** Added Option B section to `docs/aws-setup.md` documenting the stable-identity AWS path using Azure AD as the OIDC provider for AWS IAM.
+
+**Key technical facts documented:**
+
+- **UAMI access token issuer is stable.** After the IB proxy exchanges the cluster OIDC token, the resulting UAMI access token has `iss: https://login.microsoftonline.com/<tenantId>/v2.0` — this is cluster-independent. Registering that endpoint as the AWS IAM IdP gives a single registration for all clusters.
+- **`sub` in UAMI access token is the Object ID, not the client ID.** The `principalId` from `az identity show` is the correct value for the IAM trust policy `sub` condition. Using the `clientId` (application ID) here is a silent misconfiguration that causes every STS call to fail.
+- **Dedicated Entra app for audience isolation.** The token presented to AWS STS must have a stable, purpose-scoped `aud` claim. Creating a dedicated app registration (`api://aws-sts-audience`) avoids coupling AWS auth to production Azure resource audiences. The UAMI must have an app role assignment on this app before Azure AD will issue tokens for it.
+- **2-hop exchange chain (vs 1 hop in Option A).** Cluster OIDC → IB proxy → UAMI access token → dedicated-audience Azure AD JWT → AWS STS. More hops, but the `iss` and `sub` are stable across all clusters.
+- **No `aws-identity-token` projected volume needed.** Option B removes the manual volume entirely. The `azure-identity-token` from the IB webhook is the starting point for both Azure and AWS auth.
+- **Application code must call STS explicitly.** `AWS_WEB_IDENTITY_TOKEN_FILE` is not set; the AWS SDK's auto-detection flow is not used. Application acquires an Azure AD JWT for the audience app, calls `sts.AssumeRoleWithWebIdentity` directly, builds a custom credentials provider.
+- **Token refresh is application responsibility.** `ManagedIdentityCredential.GetToken` caches and refreshes the UAMI token; calling it before each STS exchange is the simplest correct approach for a long-running pod.
+
 
 - **Critical Finding: Pod never holds token with IB OIDC issuer.** IB proxy **re-signs** cluster's standard OIDC token when exchanging with Entra. Pod's token file always carries cluster OIDC issuer (`https://oidc.prod-aks.azure.com/<cluster-guid>/`). IB OIDC issuer (`ib.oic.prod-aks.azure.com`) is internal proxy infrastructure.
 - **Implication for AWS:** Registering IB OIDC issuer in AWS IAM is mechanically possible (JWKS endpoint is public) but irrelevant because pod never holds token with that issuer.
@@ -73,3 +119,18 @@
 - **IB preview open questions:** JWKS format conformance to AWS IdP requirements (unverified); webhook idempotency on volume name conflicts (test required); cross-cluster Entra app FIC issuer does not benefit from single-FIC-per-UAMI promise (pre-existing constraint).
 - **Recommendation:** Use cluster OIDC token for AWS (second projected volume), register each cluster issuer in AWS IAM, scope AWS IAM role tightly, consider pod separation if containment critical, document combined credential model.
 - **Decision merged into primary decisions.md.**
+
+### 2026-04-30 — UAMI Shared Identity Documentation
+
+**Work completed:** Created `docs/uami-shared-identity.md` — comprehensive analysis of using a single UAMI for both cross-tenant Azure and AWS authentication paths.
+
+**Content:**
+- ASCII token flow diagram showing fork point after IB proxy
+- Comparison table: shared UAMI vs. split UAMI
+- 5 architectural advantages
+- 5 accepted trade-offs with blast radius analysis
+- 6 security sections: confused deputy implications, token co-location risks, IAM sub pinning, separation of duty, monitoring/alerting patterns, split UAMI decision criteria
+- Decision table for when to split
+- Cross-references to decision log
+
+**Key insight:** Both paths are independent downstream branches from the same UAMI credential. Zero UAMI configuration changes required to add AWS path alongside Azure path. Trade-off is wider blast radius from pod compromise.
