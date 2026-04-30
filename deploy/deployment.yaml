@@ -77,6 +77,19 @@ spec:
             - name: SETUP_DB_PATH
               value: "/data/setup.db"
 
+            # ---- AWS Option B: Azure AD stable identity path (optional) ----
+            # Leave blank or remove these four vars to disable AWS writes.
+            # Set all four to enable the stable cross-cluster AWS write path.
+            # See docs/aws-setup.md Option B for setup instructions.
+            - name: AWS_ROLE_ARN
+              value: ""   # e.g., arn:aws:iam::123456789012:role/aks-timestampwriter
+            - name: AWS_REGION
+              value: ""   # e.g., us-east-1
+            - name: AWS_STS_AUDIENCE_APP_ID
+              value: ""   # Client ID of the Entra app created in Step B1
+            - name: AWS_S3_BUCKET
+              value: ""   # S3 bucket name (must already exist)
+
           resources:
             requests:
               memory: "64Mi"

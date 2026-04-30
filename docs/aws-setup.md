@@ -2,6 +2,11 @@
 
 This guide extends the cross-tenant Azure write path with an AWS write path. The same AKS pod that writes timestamps to Azure Blob Storage (source → target tenant) also writes to an AWS S3 bucket — both from a single pod, with no secrets stored anywhere.
 
+Two approaches are documented below:
+
+- **Option A** — Each cluster registers its unique OIDC issuer in AWS IAM. Simple per-cluster setup. Requires a new IAM IdP registration per cluster.
+- **Option B** — Register Azure AD (`https://login.microsoftonline.com/<tenant-id>/v2.0`) as the single AWS IAM OIDC provider. One Entra app registration in your source tenant is all that's needed for every cluster, forever. New clusters inherit AWS access automatically with zero AWS changes.
+
 **Authentication flows through:**
 1. AKS pod → projected service account token (`aud: sts.amazonaws.com`, cluster OIDC issuer)
 2. AWS STS `AssumeRoleWithWebIdentity` → short-lived AWS credentials
@@ -30,6 +35,21 @@ This guide documents two independent approaches for configuring AWS access from 
 **Option A** is simpler to set up and appropriate when you have one cluster or a small, stable cluster fleet.
 
 **Option B** eliminates the N-IAM-IdP scaling problem by using `https://login.microsoftonline.com/<ENTRA_SOURCE_TENANT_ID>/v2.0` as the single registered OIDC provider. The UAMI access token (issued by that stable endpoint, with `sub` = UAMI Object ID) is used as the web identity token for AWS STS. This is the AWS analog of how Identity Bindings make the Azure path cluster-independent.
+
+---
+
+### The Single Entra App = Stable AWS Identity
+
+**Option B unlocks a key scaling property: one Entra app registration in your source tenant enables stable AWS authentication for all current and future AKS clusters.**
+
+Here's why:
+
+- **Stable OIDC issuer.** The UAMI access token always has `iss: https://login.microsoftonline.com/<source-tenant-id>/v2.0` — this Microsoft-owned endpoint never changes, regardless of which cluster the pod runs on. Register it once in AWS IAM, and it covers all clusters forever.
+- **Stable subject (`sub`).** The UAMI's Object ID is the same whether the pod runs on cluster 1, cluster 10, or cluster 100. AWS trust policies use the UAMI Object ID as the `sub` condition — it stays constant.
+- **Zero AWS changes per cluster.** Adding a 10th, 20th, or 100th AKS cluster requires zero changes in AWS (no new IAM IdP registrations, no IAM role updates, no trust policy changes). Each new cluster only needs a new Kubernetes Identity Binding resource pointing to the same UAMI.
+- **Single identity correlation.** Azure Monitor and CloudTrail both see the same UAMI Object ID across all clusters, making audit and troubleshooting coherent.
+
+**Contrast with Option A:** Each cluster has a unique OIDC issuer URL. AWS requires a separate IAM Identity Provider per issuer, and the trust policy must list each cluster's issuer in a condition. Scaling to 10 clusters means 10 registrations and a 10-statement trust policy.
 
 ---
 
@@ -352,6 +372,8 @@ The existing `azblob` write path does not change. Both writes happen in the same
 ---
 
 ## Option B: Azure AD as OIDC Provider (Stable Cross-Cluster Identity)
+
+Register one Entra app in the source tenant. That's the only Azure resource needed to give every AKS cluster using your UAMI stable, automatic AWS access.
 
 ### The N-IdP Scaling Problem
 

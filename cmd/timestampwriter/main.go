@@ -3,10 +3,17 @@
 // # What this binary does
 //
 // timestampwriter runs as a long-lived Kubernetes pod and writes a small
-// timestamp blob to an Azure Blob Storage container every 30 seconds. The
-// storage account lives in a *different* Azure tenant than the AKS cluster
-// running this pod. Cross-tenant access is achieved without any secrets or
-// managed identity shared across tenants.
+// timestamp object every 30 seconds to two independent storage targets:
+//
+//  1. Azure Blob Storage (in a different tenant — see the Azure path section below).
+//  2. AWS S3 (Option B — via Azure AD as the stable OIDC provider for AWS STS).
+//
+// Both writes happen on every tick independently. A failure on either path is
+// logged but does not block or affect the other path.
+//
+// The AWS write path is optional: it is enabled only when all four env vars
+// (AWS_ROLE_ARN, AWS_STS_AUDIENCE_APP_ID, AWS_S3_BUCKET, AWS_REGION) are set.
+// If any are absent the AWS path is silently skipped.
 //
 // # AKS Identity Bindings (preview)
 //
@@ -34,7 +41,7 @@
 // app*, not for the UAMI directly. This is what makes cross-tenant writes
 // possible.
 //
-// # Cross-tenant token exchange flow
+// # Cross-tenant Azure token exchange flow
 //
 //  1. Pod's projected OIDC token is issued by the IB OIDC issuer
 //     (https://ib.oic.prod-aks.azure.com/<tenant>/<uami-client-id>).
@@ -60,6 +67,29 @@
 // Entra app points at the IB OIDC issuer, and any cluster bound to that UAMI
 // can authenticate — no per-cluster FICs needed, no limit to hit.
 //
+// # AWS Option B: Azure AD as stable OIDC provider for AWS STS
+//
+// Option B reuses the UAMI access token — already obtained as part of the
+// Azure write path — as the web identity token presented to AWS STS. Because
+// that token is issued by https://login.microsoftonline.com/<tenantId>/v2.0
+// (stable across all clusters), only one IAM Identity Provider registration is
+// needed in AWS, regardless of how many AKS clusters run this workload.
+//
+// The token exchange chain for the AWS path is:
+//
+//	cluster OIDC token (azure-identity-token)
+//	    ↓  IB proxy re-signs
+//	UAMI access token  [iss: login.microsoftonline.com/<tenantId>/v2.0, sub: UAMI OID]
+//	    ↓  application requests dedicated-audience token (AWS_STS_AUDIENCE_APP_ID)
+//	Azure AD JWT       [iss: login.microsoftonline.com/<tenantId>/v2.0, aud: api://aws-sts-audience]
+//	    ↓  AWS STS AssumeRoleWithWebIdentity
+//	Short-lived AWS credentials
+//	    ↓
+//	S3 PutObject
+//
+// STS credentials are re-acquired on every tick rather than cached, keeping
+// the implementation simple and correct without a refresh background goroutine.
+//
 // # Storage configuration (lazy + fallback)
 //
 // Storage config is resolved lazily (each tick) to allow the pod to start
@@ -83,8 +113,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awscredentials "github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	_ "modernc.org/sqlite"
 )
 
@@ -93,6 +129,113 @@ import (
 type storageConfig struct {
 	accountURL    string
 	containerName string
+}
+
+// awsConfig holds the resolved AWS Option B target configuration.
+// All four fields are required; if any env var is absent, the AWS write path is disabled.
+type awsConfig struct {
+	roleARN       string // AWS_ROLE_ARN
+	audienceAppID string // AWS_STS_AUDIENCE_APP_ID — client ID of dedicated Entra app
+	bucketName    string // AWS_S3_BUCKET
+	region        string // AWS_REGION
+}
+
+// loadAWSConfig reads the four Option B env vars required for the AWS write path.
+// If any are absent, it returns (awsConfig{}, false) — the AWS path is silently
+// disabled. This mirrors the loadStorageConfig signature.
+func loadAWSConfig() (awsConfig, bool) {
+	roleARN := os.Getenv("AWS_ROLE_ARN")
+	audienceAppID := os.Getenv("AWS_STS_AUDIENCE_APP_ID")
+	bucketName := os.Getenv("AWS_S3_BUCKET")
+	region := os.Getenv("AWS_REGION")
+	if roleARN == "" || audienceAppID == "" || bucketName == "" || region == "" {
+		return awsConfig{}, false
+	}
+	return awsConfig{
+		roleARN:       roleARN,
+		audienceAppID: audienceAppID,
+		bucketName:    bucketName,
+		region:        region,
+	}, true
+}
+
+// writeTimestampObject implements the AWS Option B write path.
+//
+// On each call it:
+//  1. Acquires an Azure AD JWT scoped to the dedicated Entra app audience
+//     (audienceAppID + "/.default"). The WorkloadIdentityCredential handles
+//     the cluster OIDC → IB proxy → UAMI token exchange automatically; we
+//     only need to request the correct scope here.
+//  2. Calls STS AssumeRoleWithWebIdentity, passing the Azure AD JWT as the
+//     web identity token. This is an unauthenticated STS call — the JWT is
+//     the credential, so anonymous AWS credentials are used for the request.
+//  3. Wraps the short-lived STS credentials in a static provider and builds
+//     an S3 client.
+//  4. Writes a small text object with key timestamps/timestamp-{RFC3339}.txt.
+//
+// STS credentials are re-acquired on every call rather than cached. STS calls
+// are fast and the Azure AD token is short-lived (1 h default); re-acquiring
+// per tick is simpler and always correct.
+func writeTimestampObject(ctx context.Context, cred *azidentity.WorkloadIdentityCredential, cfg awsConfig, now time.Time) error {
+	// Step 1: acquire Azure AD JWT for the dedicated Entra app audience.
+	// The /.default suffix requests the app's configured application permissions.
+	tokenResp, err := cred.GetToken(ctx, policy.TokenRequestOptions{
+		Scopes: []string{cfg.audienceAppID + "/.default"},
+	})
+	if err != nil {
+		return fmt.Errorf("acquire azure ad jwt for aws sts: %w", err)
+	}
+
+	// Step 2: call STS AssumeRoleWithWebIdentity with the Azure AD JWT.
+	// Use anonymous credentials — AssumeRoleWithWebIdentity does not require
+	// signed AWS credentials when a web identity token is provided.
+	stsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(cfg.region),
+		awsconfig.WithCredentialsProvider(aws.AnonymousCredentials{}),
+	)
+	if err != nil {
+		return fmt.Errorf("load aws sts config: %w", err)
+	}
+	stsClient := sts.NewFromConfig(stsCfg)
+
+	roleSessionName := "aks-timestampwriter"
+	assumed, err := stsClient.AssumeRoleWithWebIdentity(ctx, &sts.AssumeRoleWithWebIdentityInput{
+		RoleArn:          &cfg.roleARN,
+		RoleSessionName:  &roleSessionName,
+		WebIdentityToken: &tokenResp.Token,
+	})
+	if err != nil {
+		return fmt.Errorf("sts assume role with web identity: %w", err)
+	}
+
+	// Step 3: build a static credentials provider from the STS response.
+	staticCreds := awscredentials.NewStaticCredentialsProvider(
+		*assumed.Credentials.AccessKeyId,
+		*assumed.Credentials.SecretAccessKey,
+		*assumed.Credentials.SessionToken,
+	)
+
+	// Step 4: build S3 client with the short-lived credentials and write the object.
+	s3Cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(cfg.region),
+		awsconfig.WithCredentialsProvider(staticCreds),
+	)
+	if err != nil {
+		return fmt.Errorf("load aws s3 config: %w", err)
+	}
+	s3Client := s3.NewFromConfig(s3Cfg)
+
+	key := "timestamps/timestamp-" + now.UTC().Format(time.RFC3339) + ".txt"
+	content := now.UTC().Format(time.RFC3339)
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &cfg.bucketName,
+		Key:    &key,
+		Body:   strings.NewReader(content),
+	})
+	if err != nil {
+		return fmt.Errorf("s3 put object %q: %w", key, err)
+	}
+	return nil
 }
 
 // storageAccountNameRE validates Azure storage account names: 3–24 lowercase letters and digits.
@@ -218,8 +361,13 @@ func writeTimestampBlob(ctx context.Context, client *azblob.Client, containerNam
 //     app client ID (from the ConfigMap), not the UAMI client ID injected by
 //     the IB webhook. This causes the credential to perform the cross-tenant
 //     token exchange on every authenticated call.
-//  2. On each 30-second tick, lazily resolves storage configuration (env vars
-//     or SQLite DB) and writes a timestamp blob to the target tenant's storage.
+//  2. Reads optional AWS Option B configuration from env vars. If all four
+//     vars (AWS_ROLE_ARN, AWS_STS_AUDIENCE_APP_ID, AWS_S3_BUCKET, AWS_REGION)
+//     are present, the AWS write path is enabled alongside the Azure path.
+//  3. On each 30-second tick, lazily resolves Azure storage configuration (env
+//     vars or SQLite DB) and writes a timestamp blob to the target tenant's
+//     storage. If the AWS path is enabled, also writes to S3 (re-acquiring STS
+//     credentials on each tick). Either write can fail independently.
 //
 // Lazy config resolution means the pod can reach Running state and begin the
 // identity handshake before the admin finishes the setup wizard. Once config
@@ -233,6 +381,13 @@ func run(ctx context.Context, dbPath string, logger *slog.Logger) error {
 	cred, err := azidentity.NewWorkloadIdentityCredential(nil)
 	if err != nil {
 		return fmt.Errorf("create workload identity credential: %w", err)
+	}
+
+	// Load AWS Option B config once. If any env var is absent awsCfg is zero
+	// and awsEnabled is false — the AWS path is silently skipped every tick.
+	awsCfg, awsEnabled := loadAWSConfig()
+	if awsEnabled {
+		logger.Info("aws option b write path enabled", "bucket", awsCfg.bucketName, "region", awsCfg.region)
 	}
 
 	ticker := time.NewTicker(30 * time.Second)
@@ -285,9 +440,23 @@ func run(ctx context.Context, dbPath string, logger *slog.Logger) error {
 				// yet — Azure RBAC can take several minutes to become effective.
 				// Log and keep retrying — do not crash.
 				logger.Error("failed to write blob (RBAC may not be assigned yet)", "error", err)
-				continue
+			} else {
+				logger.Info("azure blob written", "timestamp", t.UTC().Format(time.RFC3339))
 			}
-			logger.Info("blob written", "timestamp", t.UTC().Format(time.RFC3339))
+
+			// AWS Option B write — independent of the Azure path; errors are
+			// logged but never block or affect the Azure write.
+			if awsEnabled {
+				if err := func() error {
+					writeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+					defer cancel()
+					return writeTimestampObject(writeCtx, cred, awsCfg, t)
+				}(); err != nil {
+					logger.Error("failed to write s3 object", "error", err)
+				} else {
+					logger.Info("s3 object written", "timestamp", t.UTC().Format(time.RFC3339))
+				}
+			}
 		}
 	}
 }
