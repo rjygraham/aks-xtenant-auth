@@ -103,8 +103,11 @@ spec:
             # Shared persistent volume written by the setup wizard.
             # The timestampwriter opens setup.db read-only on each tick to
             # discover the target storage account once the admin completes setup.
+            # readOnly: true matches the application's own read-only SQLite open
+            # mode and prevents any process in this container from modifying the DB.
             - name: setup-db
               mountPath: /data
+              readOnly: true
 
       volumes:
         - name: setup-db

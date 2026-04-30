@@ -46,6 +46,11 @@
 - **All placeholders reference `docs/azure-setup.md`.** Three values must be filled before deploying: `MANAGED_IDENTITY_CLIENT_ID`, `SOURCE_TENANT_ID`, and `TARGET_STORAGE_ACCOUNT`. The ACR hostname is also a placeholder. Each is tagged with a `# TODO:` comment pointing to Bishop's azure-setup doc.
 - **`readOnlyRootFilesystem: true` is safe here** because the app writes to Azure Blob (remote), not to local disk. The distroless image has no writable directories the app needs.
 
+### 2026-04-29 — Repository history squashed to single commit
+
+- **Git history rewritten using orphan branch technique.** All ~10 commits were squashed into a single initial commit (a40d61e). The orphan branch `initial-state` was created, all files committed, the old `main` branch deleted, and `initial-state` renamed to `main`. This ensures clean project initialization from the curated state.
+- **Commit message includes all essential context.** The single commit message documents the project's core purpose: AKS workload identity via Identity Bindings, cross-tenant auth to Azure Blob Storage, and the key innovation (bypassing the 20 FIC limit via UAMI-bound bindings).
+
 ## 2026-04-29
 
 ### Setup Wizard Database Volume (hudson-2)

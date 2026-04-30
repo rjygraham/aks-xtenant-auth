@@ -46,3 +46,14 @@
 - **Production architecture verdict: LOW-MEDIUM RISK.** Well-defended on identity chain; unmitigated RBAC over-scoping at RG level (should narrow to container scope). Documentation contained errors (fixed by Bishop in commit 29d85c1).
 - **Concurrent Bishop analysis confirmed.** 6-vector threat model matches architectural review findings.
 - **Decision merged into primary decisions.md entry.**
+
+### 2026-04-30 — Broad Code & Security Audit
+
+- **Overall verdict: LOW risk posture.** Token handling, CSRF, consent flow, RBAC manifests, and image supply chain are all sound. No exploitable vulnerabilities in the primary threat model identified.
+- **Token handling is correct.** `NewWorkloadIdentityCredential(nil)` called once at startup is the right pattern. SDK handles token refresh automatically by re-reading `AZURE_FEDERATED_TOKEN_FILE` on each acquisition. No token cache poisoning risk.
+- **Consent flow is not PKCE.** The `Dockerfile.setup` has a stale comment saying "PKCE callbacks" — the actual implementation (per Dallas/Simplified Setup Wizard decision) is a plain admin consent redirect with no token exchange. State CSRF protection (128-bit crypto/rand, HttpOnly cookie, SameSite=Lax) is correctly implemented.
+- **Two input validation gaps on storage SDK call paths.** `container_name` and `storage_account_name` from SQLite flow into Azure SDK calls without regex validation. Low exploitability (requires NFS write access), but cheap to fix with `^[a-z0-9]{3,24}$` and `^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$` checks.
+- **Missing NetworkPolicy.** No `NetworkPolicy` in `deploy/` means any pod in the cluster can reach the setup wizard's HTTP server on 8081 via ClusterIP. A `NetworkPolicy` restricting ingress to kubectl port-forward clients is the highest-priority manifest fix.
+- **`readOnlyRootFilesystem: false` on both pods** is an accepted trade-off documented in the manifests (modernc.org/sqlite writes to /tmp). Remaining controls (non-root, drop ALL caps, RuntimeDefault seccomp) maintain meaningful depth.
+- **No liveness probe on timestampwriter** — operational gap, not security gap. A hung write loop is invisible to Kubernetes.
+- **Priority fixes documented in `.squad/decisions/inbox/ripley-security-audit.md`** (7 items, 4 code/manifest changes).

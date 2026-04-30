@@ -78,6 +78,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -93,6 +94,13 @@ type storageConfig struct {
 	accountURL    string
 	containerName string
 }
+
+// storageAccountNameRE validates Azure storage account names: 3–24 lowercase letters and digits.
+var storageAccountNameRE = regexp.MustCompile(`^[a-z0-9]{3,24}$`)
+
+// containerNameRE validates Azure blob container names: 3–63 characters, lowercase letters,
+// digits, and hyphens; must start and end with a letter or digit.
+var containerNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
 
 // loadStorageConfig resolves the target storage account configuration.
 //
@@ -116,6 +124,9 @@ func loadStorageConfig(dbPath string) (storageConfig, bool, error) {
 	accountURL := os.Getenv("STORAGE_ACCOUNT_URL")
 	containerName := os.Getenv("STORAGE_CONTAINER_NAME")
 	if accountURL != "" && containerName != "" {
+		if !containerNameRE.MatchString(containerName) {
+			return storageConfig{}, false, fmt.Errorf("STORAGE_CONTAINER_NAME %q is not a valid Azure container name", containerName)
+		}
 		return storageConfig{accountURL: accountURL, containerName: containerName}, true, nil
 	}
 
@@ -151,6 +162,10 @@ func loadStorageConfig(dbPath string) (storageConfig, bool, error) {
 		return storageConfig{}, false, fmt.Errorf("parse resource ID from DB: %w", err)
 	}
 
+	if !containerNameRE.MatchString(container) {
+		return storageConfig{}, false, fmt.Errorf("container name %q from DB is not a valid Azure container name", container)
+	}
+
 	return storageConfig{
 		accountURL:    fmt.Sprintf("https://%s.blob.core.windows.net", accountName),
 		containerName: container,
@@ -158,7 +173,8 @@ func loadStorageConfig(dbPath string) (storageConfig, bool, error) {
 }
 
 // parseStorageAccountName extracts the storage account name from an Azure
-// resource ID. The expected format is:
+// resource ID and validates it against Azure's naming rules (3–24 lowercase
+// letters and digits). The expected format is:
 //
 //	/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Storage/storageAccounts/{name}
 //
@@ -168,7 +184,11 @@ func parseStorageAccountName(resourceID string) (string, error) {
 	parts := strings.Split(resourceID, "/")
 	for i, p := range parts {
 		if strings.EqualFold(p, "storageAccounts") && i+1 < len(parts) && parts[i+1] != "" {
-			return parts[i+1], nil
+			name := parts[i+1]
+			if !storageAccountNameRE.MatchString(name) {
+				return "", fmt.Errorf("storage account name %q extracted from resource ID does not match Azure naming rules (3-24 lowercase letters/digits)", name)
+			}
+			return name, nil
 		}
 	}
 	return "", fmt.Errorf("storageAccounts segment not found in resource ID %q", resourceID)
@@ -253,7 +273,13 @@ func run(ctx context.Context, dbPath string, logger *slog.Logger) error {
 				logger.Info("storage account configured", "account", cfg.accountURL, "container", cfg.containerName)
 			}
 
-			if err := writeTimestampBlob(ctx, client, cfg.containerName, t); err != nil {
+			if err := func() error {
+				// 15-second timeout per upload prevents a stalled network call
+				// from blocking all subsequent ticks indefinitely.
+				uploadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				defer cancel()
+				return writeTimestampBlob(uploadCtx, client, cfg.containerName, t)
+			}(); err != nil {
 				// A 403 AuthorizationPermissionMismatch here typically means the
 				// RBAC assignment (Storage Blob Data Contributor) hasn't propagated
 				// yet — Azure RBAC can take several minutes to become effective.

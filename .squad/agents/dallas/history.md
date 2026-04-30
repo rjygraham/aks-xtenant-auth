@@ -9,6 +9,13 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### 2026-04-29 — Verbose code comments added to both Go source files
+
+- `cmd/timestampwriter/main.go` and `cmd/setup/main.go` both received full package-level doc comments, godoc-style function comments, and inline comments on non-obvious logic.
+- Package comments explain: Identity Bindings architecture, the two-client-ID pattern (UAMI client ID on ServiceAccount vs. Entra app client ID in ConfigMap), the cross-tenant token exchange flow, and the 20-FIC limit bypass via the IB OIDC issuer.
+- Inline comments call out: why AZURE_CLIENT_ID is overridden from the ConfigMap, why the IB OIDC issuer differs from the cluster OIDC issuer, the lazy SQLite fallback and why NFS is required, and why 403 on blob upload is treated as a retryable RBAC propagation delay.
+- No logic was changed — comments only.
+
 ### 2026-04-29 — SQLite persistence added to setup wizard
 
 - Added `modernc.org/sqlite` (pure Go, no CGO) for SQLite — required for distroless containers where CGO-based drivers fail at runtime.

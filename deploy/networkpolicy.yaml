@@ -1,0 +1,83 @@
+# NetworkPolicy — aks-xtenant-auth namespace
+#
+# Two policies are defined here:
+#
+#   1. timestampwriter: no inbound traffic; outbound restricted to DNS and
+#      HTTPS to Azure services. IMDS (169.254.169.254) is explicitly excluded
+#      from the allowed egress CIDR. The timestampwriter has no need to query
+#      IMDS — it uses the IB-projected SA token, not a managed identity token.
+#
+#   2. setup: no inbound network-level traffic (kubectl port-forward bypasses
+#      NetworkPolicy and is the only intended access method); outbound
+#      restricted to DNS and HTTPS for the Microsoft admin consent redirect.
+#      IMDS is excluded for the same reason as above.
+#
+# Note: kubectl port-forward tunnels through the Kubernetes API server and
+# delivers traffic on the pod's loopback interface, which is outside the
+# scope of NetworkPolicy. The setup pod's HTTP port (8081) is therefore still
+# reachable via port-forward without relaxing ingress rules.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: timestampwriter
+  namespace: aks-xtenant-auth
+spec:
+  podSelector:
+    matchLabels:
+      app: timestampwriter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []  # timestampwriter has no inbound listeners — deny all ingress
+  egress:
+    # DNS — required for Azure SDK hostname resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS to Azure services: Entra ID, Azure Blob Storage, IB OIDC endpoint.
+    # 169.254.169.254/32 (IMDS) is excluded — the timestampwriter authenticates
+    # via the IB-projected SA token and has no legitimate reason to call IMDS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: setup
+  namespace: aks-xtenant-auth
+spec:
+  podSelector:
+    matchLabels:
+      app: setup
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []  # kubectl port-forward is the only intended access path (loopback — not affected by NetworkPolicy)
+  egress:
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS to login.microsoftonline.com for admin consent redirect.
+    # IMDS excluded — setup pod uses no managed identity.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 443

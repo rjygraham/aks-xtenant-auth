@@ -42,7 +42,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
 #   - The :nonroot tag sets UID/GID 65532, satisfying runAsNonRoot in K8s.
 #   - "static-debian12" is appropriate for CGO_ENABLED=0 Go binaries with no
 #     system library dependencies.
-#   - This wizard handles OAuth PKCE callbacks — keeping the image surface
+#   - This wizard handles admin consent callbacks — keeping the image surface
 #     minimal reduces the blast radius if a dependency is ever compromised.
 # =============================================================================
 FROM gcr.io/distroless/static-debian12:nonroot
@@ -50,7 +50,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 # Copy only the compiled binary from the builder stage.
 COPY --from=builder /setup /setup
 
-# The setup wizard serves the PKCE flow on port 8081.
+# The setup wizard serves the admin consent callback flow on port 8081.
 # This must match SETUP_PORT in the ConfigMap and containerPort in the Deployment.
 EXPOSE 8081
 

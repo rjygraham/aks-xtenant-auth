@@ -484,13 +484,19 @@ az group create \
   --name "$TARGET_RESOURCE_GROUP" \
   --location "$LOCATION"
 
-# Create the storage account
+# Create the storage account with hardened settings:
+#   --allow-shared-key-access false  : requires identity-based auth (no storage keys)
+#   --min-tls-version TLS1_2         : reject connections below TLS 1.2
+#   --allow-blob-public-access false : no anonymous blob access
 az storage account create \
   --resource-group "$TARGET_RESOURCE_GROUP" \
   --name "$STORAGE_ACCOUNT_NAME" \
   --location "$LOCATION" \
   --sku "Standard_LRS" \
-  --https-only true
+  --https-only true \
+  --allow-shared-key-access false \
+  --min-tls-version TLS1_2 \
+  --allow-blob-public-access false
 
 # Get the storage account ID (needed for RBAC role assignment)
 STORAGE_ACCOUNT_ID=$(az storage account show \
@@ -518,20 +524,23 @@ Assign the `Storage Blob Data Contributor` role to the target tenant's service p
 ```bash
 az account set --subscription "$TARGET_SUBSCRIPTION_ID"
 
-# Assign Storage Blob Data Contributor to the service principal
+# Assign Storage Blob Data Contributor scoped to the specific container.
+# Container-scope limits the blast radius to this container only — the SP
+# cannot access any other container or storage account in the tenant.
+CONTAINER_SCOPE="${STORAGE_ACCOUNT_ID}/blobServices/default/containers/${STORAGE_CONTAINER_NAME}"
+
 az role assignment create \
   --role "Storage Blob Data Contributor" \
   --assignee-object-id "$TARGET_SP_OBJECT_ID" \
   --assignee-principal-type "ServicePrincipal" \
-  --scope "$STORAGE_ACCOUNT_ID"
+  --scope "$CONTAINER_SCOPE"
 
-echo "RBAC role 'Storage Blob Data Contributor' assigned to service principal"
+echo "RBAC role 'Storage Blob Data Contributor' assigned at container scope"
 ```
 
 **What this does:**
-- The service principal (of the source app in the target tenant) can now read, write, and delete blobs
-- The role is scoped to the entire storage account; the app can access any container
-- If you want to restrict to a single container, add `--scope "$STORAGE_ACCOUNT_ID/blobServices/default/containers/$STORAGE_CONTAINER_NAME"`
+- The service principal (of the source app in the target tenant) can read, write, and delete blobs in `$STORAGE_CONTAINER_NAME` only
+- Scoping to the container (not the storage account) is **least-privilege**: the SP cannot access any other container or storage account
 
 ---
 
@@ -702,12 +711,15 @@ kubectl apply -f deploy/setup-pv.yaml
 kubectl apply -f deploy/setup-pvc.yaml -n "$K8S_NAMESPACE"
 kubectl apply -f deploy/serviceaccount.yaml
 kubectl apply -f deploy/configmap.yaml
+kubectl apply -f deploy/networkpolicy.yaml
 kubectl apply -f deploy/deployment.yaml
 
 # Verify deployment is running
 kubectl get deployment -n "$K8S_NAMESPACE"
 kubectl get pods -n "$K8S_NAMESPACE"
 ```
+
+> **⚠️ Namespace RBAC — important security note:** Any pod in the `aks-xtenant-auth` namespace that is scheduled with `serviceAccountName: timestampwriter` and the `use-identity-binding: "true"` annotation will receive the Identity Binding token and can perform cross-tenant blob writes. Kubernetes does not support pod-level RBAC — the control boundary is at the namespace level. Restrict `pods/create` permissions in this namespace to your deployment pipeline only. No end-user or application service account should be able to create pods in this namespace.
 
 ---
 
@@ -773,47 +785,25 @@ This option uses a web-based setup wizard (deployed as a Kubernetes pod) that ha
 
 ### Additional App Registration Requirements for the Setup Wizard
 
-The multi-tenant Entra app registration needs these additional configurations before the setup wizard can be used. Run these commands in the source tenant:
+The multi-tenant Entra app registration needs one additional configuration before the setup wizard can be used — a redirect URI for the admin consent callback. Run this in the source tenant:
 
-#### 1. Add Redirect URIs
+#### Add Redirect URI
 
 ```bash
-# Add redirect URIs for the setup wizard callbacks
+# Add the redirect URI for the admin consent callback
 az ad app update --id $APP_CLIENT_ID \
-  --web-redirect-uris \
-    "${SETUP_REDIRECT_BASE_URI}/callback" \
-    "${SETUP_REDIRECT_BASE_URI}/mgmt-callback"
+  --web-redirect-uris "${SETUP_REDIRECT_BASE_URI}/callback"
 
-echo "Redirect URIs added to app registration"
+echo "Redirect URI added to app registration"
 ```
 
-#### 2. Add Delegated API Permissions
+> **Note:** No additional API permissions (Microsoft Graph, Azure Service Management) are required. The setup wizard uses only the admin consent redirect flow — it never calls Graph or ARM APIs on behalf of the user.
 
-The wizard requests delegated permissions (not app-only) so the target tenant admin grants consent interactively:
-
-```bash
-# Add Microsoft Graph - Application.Read.All (delegated)
-az ad app permission add \
-  --id $APP_CLIENT_ID \
-  --api 00000003-0000-0000-c000-000000000000 \
-  --api-permissions 9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30=Scope
-
-# Add Azure Service Management - user_impersonation (delegated)
-az ad app permission add \
-  --id $APP_CLIENT_ID \
-  --api 797f4846-ba00-4fd7-ba43-dac1f8f63013 \
-  --api-permissions 41094075-9dad-400e-a0bd-54e686782033=Scope
-
-echo "Delegated permissions added to app registration"
-```
-
-**Note:** Admin consent is granted during the wizard flow (Step 3 below), not through `az ad app permission grant`.
-
-#### 3. Admin Requirements
+#### Admin Requirements
 
 The person who runs the setup wizard must have:
-- **Global Administrator** or **Application Administrator** in the target tenant (to grant admin consent for the app)
-- **Owner** or **User Access Administrator** on the target storage account (to assign RBAC roles)
+- **Global Administrator** or **Cloud Application Administrator** in the target tenant (to grant admin consent for the app)
+- **Owner** or **User Access Administrator** on the target storage account (to run the `az role assignment create` command shown on the success page)
 
 ### Deploying the Setup Wizard
 
@@ -853,6 +843,7 @@ kubectl apply -f deploy/setup-pvc.yaml -n aks-xtenant-auth
 kubectl apply -f deploy/setup-configmap.yaml
 kubectl apply -f deploy/setup-deployment.yaml
 kubectl apply -f deploy/setup-service.yaml
+kubectl apply -f deploy/networkpolicy.yaml
 
 echo "Setup wizard deployed"
 ```
@@ -881,39 +872,30 @@ kubectl get service setup -n aks-xtenant-auth
 
 1. **Open the setup wizard:** `http://localhost:8081` (or your public URL)
 
-2. **Click "Start Setup"** — you'll be taken to Microsoft login
+2. **Click "Start Setup"** — you'll be redirected to Microsoft's admin consent page
 
-3. **Sign in with your target tenant Azure credentials** — the app will ask for admin consent to:
-   - Read app information from your tenant (Microsoft Graph: `Application.Read.All`)
-   - This requires **Global Administrator** or **Application Administrator** role
+3. **Sign in with your target tenant Azure credentials** — the app will ask for tenant-wide admin consent.
+   This requires **Global Administrator** or **Cloud Application Administrator** role.
 
-4. **Grant admin consent** — after consent, you'll be redirected to authorize RBAC management access
+4. **Grant admin consent** — after consent, you'll be redirected back to the wizard
 
-5. **Sign in again** (if prompted) — the app now requests:
-   - Manage Azure resources (`user_impersonation` from Azure Service Management)
-   - This requires permissions to assign roles on your storage account
-
-6. **Enter your storage account details:**
-   - Subscription ID (target tenant)
-   - Resource Group name
-   - Storage Account name
+5. **Enter your storage account details:**
+   - Storage Account resource ID (from Azure portal → storage account → JSON view → `id` field)
    - Container name (e.g., "timestamps")
 
-7. **Click "Configure"** — the wizard:
-   - Exchanges your tokens for an access token scoped to your tenant
-   - Calls the Azure Resource Manager (ARM) REST API
-   - Assigns **Storage Blob Data Contributor** role to the source app's service principal on your storage account
+6. **Click "Configure"** — the wizard saves the configuration to the shared database.
+   No ARM API calls are made by the wizard itself.
 
-8. **Copy the ConfigMap values** — on the success page, you'll see:
-   - `STORAGE_ACCOUNT_URL` — share this with the source tenant team
-   - Application ID — confirm this matches your app registration
+7. **Run the RBAC command** — the success page shows a pre-filled `az role assignment create`
+   command scoped to your container. Run it while signed in to the target tenant as Owner
+   or User Access Administrator.
 
 ### Security Notes
 
-- **No client secrets:** The wizard uses PKCE (Proof Key for Code Exchange) — the source tenant's app registration never exposes a secret
-- **Session data:** Held in-memory and expires after 1 hour
-- **Network isolation:** Deploy on private LoadBalancer or use `kubectl port-forward`; never expose publicly to the internet
-- **Admin consent:** Granted by the target tenant admin interactively; no pre-granted permissions
+- **No client secrets or tokens:** The wizard uses a simple admin consent redirect — the source tenant's app registration never handles user tokens. The user's browser navigates directly to Microsoft's `/common/adminconsent` endpoint.
+- **One-time configuration guard:** The wizard rejects re-runs if a configuration row already exists, preventing silent production config override. To reconfigure, delete the existing row from `setup.db` manually.
+- **Network isolation:** Deploy on ClusterIP (default) and use `kubectl port-forward`; never expose publicly to the internet. kubectl port-forward requires authenticated cluster access and is the only intended path to the wizard.
+- **CSRF protection:** State is a 128-bit random value stored in an `HttpOnly`, `SameSite=Lax` cookie with a 10-minute TTL. It is validated before any action is taken on the callback.
 
 ### After the Wizard Completes
 

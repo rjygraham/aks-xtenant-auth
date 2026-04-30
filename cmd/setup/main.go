@@ -56,6 +56,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -114,6 +115,10 @@ type errorData struct {
 	Error            string
 	ErrorDescription string
 }
+
+// containerNameRE validates Azure blob container names: 3–63 characters, lowercase
+// letters, digits, and hyphens; must start and end with a letter or digit.
+var containerNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
 
 // randomHex returns n random bytes as a hex string.
 func randomHex(n int) (string, error) {
@@ -294,9 +299,13 @@ func parseStorageAccountName(resourceID string) (string, error) {
 
 // handleConfigure processes the storage configuration form submitted after
 // admin consent. It:
-//  1. Validates the resource ID by extracting the storage account name.
-//  2. Persists the consent row to SQLite.
-//  3. Renders success.html with pre-filled az CLI and ConfigMap YAML snippets
+//  1. Guards against re-runs: if a consent row already exists, returns an error
+//     rather than silently overriding the active configuration. Unintended re-runs
+//     would redirect all blob writes to the new storage account without warning.
+//  2. Validates the container name against Azure naming rules.
+//  3. Validates the resource ID by extracting the storage account name.
+//  4. Persists the consent row to SQLite.
+//  5. Renders success.html with pre-filled az CLI and ConfigMap YAML snippets
 //     for the admin to copy.
 //
 // The RBAC assignment (Storage Blob Data Contributor) is *not* automated here.
@@ -309,6 +318,33 @@ func handleConfigure(cfg config, db *sql.DB, tmpl *template.Template) http.Handl
 		tenantID := r.FormValue("tenant_id")
 		resourceID := strings.TrimSpace(r.FormValue("resource_id"))
 		containerName := strings.TrimSpace(r.FormValue("container_name"))
+
+		// One-time write guard: reject re-runs to prevent silent config override.
+		// If an admin needs to reconfigure, they must manually delete the DB row.
+		var count int
+		if err := db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM consents`).Scan(&count); err != nil {
+			slog.Error("db count check failed", "error", err)
+			renderTemplate(w, tmpl, "error.html", errorData{
+				Error:            "db_error",
+				ErrorDescription: "Failed to check existing configuration. Please try again.",
+			})
+			return
+		}
+		if count > 0 {
+			renderTemplate(w, tmpl, "error.html", errorData{
+				Error:            "already_configured",
+				ErrorDescription: "A storage configuration already exists. To reconfigure, delete the existing row from the database (setup.db) and restart the setup wizard.",
+			})
+			return
+		}
+
+		if !containerNameRE.MatchString(containerName) {
+			renderTemplate(w, tmpl, "error.html", errorData{
+				Error:            "invalid_container_name",
+				ErrorDescription: "Container name must be 3–63 lowercase letters, digits, or hyphens, and must start and end with a letter or digit.",
+			})
+			return
+		}
 
 		storageAccountName, err := parseStorageAccountName(resourceID)
 		if err != nil {

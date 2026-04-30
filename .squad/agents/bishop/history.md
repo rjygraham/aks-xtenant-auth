@@ -44,3 +44,11 @@
 
 **Recent Session (2026-04-30):** Merged 3 decision files into primary decisions.md. decisions.md grown from 3303 to 7307 bytes. All inbox files deleted.
 
+## Learnings
+
+### 2026-04-29 — Azure & Identity Security Audit
+
+- `docs/azure-setup.md` still mixes the accepted simplified admin-consent setup with a superseded PKCE/Graph/ARM design. That drift would cause operators to add unnecessary delegated permissions, redirect URIs, and broader admin expectations.
+- For the current working Identity Bindings sample, the Entra app FIC must use the **cluster standard OIDC issuer** plus audience `api://AKSIdentityBinding` and the exact ServiceAccount subject. The internal `ib.oic.prod-aks.azure.com/...` issuer remains the wrong value for the app FIC.
+- The setup wizard success page currently emits two bad operator instructions: it suggests ServiceAccount `azure.workload.identity/client-id` should be the **app** client ID instead of the **UAMI** client ID, and it generates `Storage Blob Data Contributor` at **storage-account scope** instead of container scope.
+- The shared SQLite/NFS design is only weakly isolated. Both pods mount the same RWX PVC, `timestampwriter` does not mount it read-only, and any same-namespace pod that can mount the claim could read or tamper with `setup.db`.
