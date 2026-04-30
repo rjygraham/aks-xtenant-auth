@@ -353,3 +353,167 @@ Operators should switch to separate UAMIs when any of the following apply:
 
 See `docs/uami-shared-identity.md` for the full analysis including token flow diagrams,
 security implications, and the decision table.
+
+---
+
+## 2026-04-30: AWS Option B Write Path Implementation (Dallas — Go Developer)
+
+### Implementation Details
+
+The AWS Option B write path (as documented in `docs/aws-setup.md` Step B5) uses the existing `WorkloadIdentityCredential` to acquire an Azure AD JWT for a dedicated Entra app audience, then exchanges it for short-lived STS credentials via `AssumeRoleWithWebIdentity`, then writes to S3.
+
+### Key Implementation Decisions
+
+#### 1. STS Call Uses `aws.AnonymousCredentials{}`
+
+`AssumeRoleWithWebIdentity` does not require pre-existing AWS credentials — the web identity token IS the authentication mechanism. Using `aws.AnonymousCredentials{}` for the STS `LoadDefaultConfig` call prevents the SDK from probing env vars, IMDS, or credential files, which would be confusing and potentially wrong in this context.
+
+#### 2. Re-acquire STS Credentials on Every Tick (No Caching)
+
+The simplest correct strategy for a long-running pod. STS credentials have a 1-hour default lifetime; re-acquiring per 30-second tick is negligible overhead and avoids a background refresh goroutine. Consistent with the doc's recommendation in Step B5.
+
+#### 3. `loadAWSConfig()` Returns `(awsConfig, bool)` — No Error
+
+Mirrors `loadStorageConfig`. The absence of any required env var is not an error — it means the operator has not configured the AWS path. Silent skip is the correct user experience.
+
+#### 4. AWS Write Is Independent of Azure Write in the Tick Loop
+
+Both writes happen in the same tick, each wrapped in a 15-second `context.WithTimeout`. Either can fail without affecting the other. Log lines are distinct (`"azure blob written"` vs `"s3 object written"`) for easy filtering in structured log output.
+
+#### 5. `azcore/policy` Promoted to Direct Import
+
+`policy.TokenRequestOptions` is needed to call `cred.GetToken` with a custom scope. `azcore` was already an indirect dependency; this promotes it to a direct one.
+
+### Dependencies Added
+
+| Package | Version |
+|---------|---------|
+| `github.com/aws/aws-sdk-go-v2/aws` | v1.41.7 |
+| `github.com/aws/aws-sdk-go-v2/config` | v1.32.17 |
+| `github.com/aws/aws-sdk-go-v2/credentials` | v1.19.16 |
+| `github.com/aws/aws-sdk-go-v2/service/s3` | v1.100.1 |
+| `github.com/aws/aws-sdk-go-v2/service/sts` | v1.42.1 |
+
+Note: `go get` upgraded the module from `go 1.22` to `go 1.24` (minimum required by the AWS SDK). No breaking changes observed.
+
+### Files Changed
+
+- `cmd/timestampwriter/main.go` — `awsConfig` struct, `loadAWSConfig`, `writeTimestampObject`, wired into `run()`, package comment and docstring updated
+- `go.mod` / `go.sum` — AWS SDK v2 dependencies added
+
+---
+
+## 2026-04-30: AWS Option B Environment Variables in Deployment (Hudson — DevOps)
+
+### Deployment Configuration
+
+Updated `deploy/deployment.yaml` to support AWS Option B (Azure AD stable OIDC for AWS STS) by adding four optional environment variable placeholders to the `timestampwriter` container's `env:` section.
+
+### Changes Made
+
+Added the following env vars to `deploy/deployment.yaml` after `SETUP_DB_PATH`:
+
+```yaml
+# ---- AWS Option B: Azure AD stable identity path (optional) ----
+# Leave blank or remove these four vars to disable AWS writes.
+# Set all four to enable the stable cross-cluster AWS write path.
+# See docs/aws-setup.md Option B for setup instructions.
+- name: AWS_ROLE_ARN
+  value: ""   # e.g., arn:aws:iam::123456789012:role/aks-timestampwriter
+- name: AWS_REGION
+  value: ""   # e.g., us-east-1
+- name: AWS_STS_AUDIENCE_APP_ID
+  value: ""   # Client ID of the Entra app created in Step B1
+- name: AWS_S3_BUCKET
+  value: ""   # S3 bucket name (must already exist)
+```
+
+### Rationale
+
+**Option B Design Pattern:**
+- **No projected volumes.** Option B uses Azure AD (via existing workload identity) as the stable OIDC issuer for AWS STS. The Go app acquires an Azure AD JWT and calls AWS STS `AssumeRoleWithWebIdentity` directly—no pod-level AWS token projection needed.
+- **Placeholders, not secrets.** These values are configuration (role ARN, region, client ID), not secrets. They are empty by default and operators populate them to opt-in to AWS write capability. Empty values disable AWS writes silently.
+- **Optional for backwards compatibility.** Existing deployments without these vars continue to work (Azure Blob only). New deployments set all four to enable dual-write capability.
+
+### What Was NOT Changed
+
+- **Azure identity wiring untouched.** ServiceAccount annotations, Identity Binding pod annotation, workload identity labels, AZURE_* env vars, and setup-db volumeMount all remain unchanged.
+- **No aws-identity-token volume.** Option B does not project a separate AWS OIDC token into the pod. Azure AD credential is reused (decreases attack surface, simplifies pod manifest).
+
+### Integration with Other Components
+
+- **Go app contract:** Dallas implements logic to check these env vars. If all four are populated, the app executes AWS write logic in addition to Azure Blob writes. If any are missing or empty, AWS path is skipped silently.
+- **Operators doc:** Bishop updates `docs/aws-setup.md` Section B to explain the placement of these four values and link to the AWS federation prerequisites.
+- **No K8s RBAC changes required.** Option B auth happens in the Go app layer, not in Kubernetes RBAC or workload identity webhook logic.
+
+### Security Posture
+
+- **No new attack surface in Pod manifests.** All four vars are optional and default to empty; the pod shape is identical whether Option B is enabled or disabled.
+- **Credential flow stays inside the pod.** Azure AD token is used only by the Go app to call AWS STS and acquire AWS credentials. No token projection, no mounted secrets.
+- **Operator responsibility.** Populating these vars is an operator action; the cluster has no mechanism to inject them automatically. This preserves auditability.
+
+### Files Modified
+
+- `deploy/deployment.yaml` — env section updated with four placeholder vars
+
+---
+
+## 2026-04-30: Documentation Clarity: Single Entra App = Stable AWS Identity (Bishop — Azure Engineer)
+
+### Documentation Update
+
+Added explicit, prominent documentation in `docs/aws-setup.md` clarifying why one Entra app registration is sufficient for all clusters and scales frictionlessly.
+
+### Decision
+
+Make the single Entra app scaling story explicit and prominent in `docs/aws-setup.md` at three structural levels:
+
+#### 1. Intro Paragraph (Lines 1–15)
+
+Updated the opening to name both approaches and state Option B's key benefit upfront:
+
+> "One Entra app registration in your source tenant is all that's needed for every cluster, forever. New clusters inherit AWS access automatically with zero AWS changes."
+
+**Rationale:** Operators scanning the top of the doc immediately see the scaling benefit without reading 20+ pages of steps.
+
+#### 2. After "Choosing an Approach" Table (Lines 41–52)
+
+Added a new subsection **"The Single Entra App = Stable AWS Identity"** that articulates four concrete stability properties:
+
+- **Stable OIDC issuer:** The endpoint is Microsoft-owned and never changes per cluster. One AWS registration covers all clusters.
+- **Stable `sub`:** The UAMI Object ID is identical regardless of which cluster the pod runs on.
+- **Zero AWS changes per cluster:** Scaling to 10, 20, or 100 clusters requires zero AWS IAM changes — only new Kubernetes Identity Binding resources.
+- **Single identity correlation:** The UAMI Object ID correlates across Azure Monitor and CloudTrail, enabling coherent audit and troubleshooting.
+- **Contrast with Option A:** Each cluster needs its own IAM IdP registration; scaling becomes O(N) work in AWS.
+
+**Rationale:** Operators making the Option A vs. Option B decision get a clear, before-you-commit explanation of the stability property, not a post-hoc justification buried in Step B1.
+
+#### 3. Option B Opening (Line 376)
+
+Added a one-line summary before "The N-IdP Scaling Problem" subsection:
+
+> "Register one Entra app in the source tenant. That's the only Azure resource needed to give every AKS cluster using your UAMI stable, automatic AWS access."
+
+**Rationale:** Reframes the option from "problem statement" (N-IdP scaling problem) to "solution" (single app, stable, automatic). Operators see the outcome first, then understand the problem it solves.
+
+### Technical Accuracy
+
+The clarifications are grounded in production architecture:
+
+- **Stable OIDC issuer:** UAMI access token `iss` is `https://login.microsoftonline.com/<tenant-id>/v2.0` by definition.
+- **Stable `sub`:** UAMI Object ID is the same value across all clusters. AWS trust policy pins this.
+- **Zero AWS changes per cluster:** New clusters only need a new Kubernetes Identity Binding resource pointing to the existing UAMI. No AWS IAM changes required.
+- **Single identity correlation:** UAMI Object ID appears in both Azure Monitor activity logs and CloudTrail events.
+
+### What Is NOT Changed
+
+- Option A steps (Step 1–5) remain unchanged
+- Variables block remains unchanged
+- Step B1–B5 content remains unchanged; only framing/intro is updated
+- Multi-Cluster Considerations section remains unchanged (already well written)
+- Step numbering and structure remain intact
+- No changes to cross-tenant Azure path documentation
+
+### Files Modified
+
+- `docs/aws-setup.md` — Intro and Option B framing updated with three clarifying edits

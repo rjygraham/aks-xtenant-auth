@@ -9,6 +9,18 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### 2026-04-30 — AWS Option B placeholder env vars in Deployment
+
+- **Option B does not use projected volumes.** AWS Option B allows the Go app to use Azure AD as a stable cross-cluster OIDC provider for AWS STS. Unlike Option A, this design does not require a projected `aws-identity-token` volume in the pod — the app acquires an Azure AD JWT through the existing workload identity credential and calls AWS STS directly.
+- **Four AWS env vars added as optional placeholders.** `AWS_ROLE_ARN`, `AWS_REGION`, `AWS_STS_AUDIENCE_APP_ID`, and `AWS_S3_BUCKET` are added to the `env:` section with empty string values. Operators fill these when enabling Option B writes. When all are populated, the Go app activates AWS write logic; when absent or empty, the app skips AWS writes silently.
+- **Azure identity wiring unchanged.** No modifications to ServiceAccount annotations, workload identity labels, AZURE_* env vars, or volume mounts. The Azure Blob Storage path (primary target) remains the default; AWS is a supplemental write target controlled by these placeholders.
+
+### 2026-04-30 — AWS Option B orchestration & documentation complete
+
+- Session orchestration via Scribe: merged 3 decision inbox files (Dallas, Hudson, Bishop implementation notes) into primary decisions.md as detailed decision entries.
+- Orchestration logs created; session log written documenting coordinated AWS Option B implementation.
+- Deployment manifest env vars aligned with Dallas's Go implementation and Bishop's documentation clarity edits.
+
 ### 2026-04-29 — SQLite persistent storage for setup wizard
 
 - **PVC over emptyDir for setup wizard DB.** The setup wizard writes `/data/setup.db` via `modernc.org/sqlite`. A PVC (`setup-db`, 100Mi, ReadWriteOnce) is used so the database survives pod restarts. emptyDir would destroy the DB on every restart, breaking in-progress admin flows.

@@ -9,6 +9,25 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### 2026-04-30 — AWS Option B write path implemented
+
+- `cmd/timestampwriter/main.go` now writes timestamps to both Azure Blob Storage and AWS S3 on every tick, independently.
+- AWS path is **opt-in via env vars**: all four of `AWS_ROLE_ARN`, `AWS_STS_AUDIENCE_APP_ID`, `AWS_S3_BUCKET`, `AWS_REGION` must be set; if any are absent the path is silently skipped.
+- `awsConfig` struct mirrors `storageConfig`; `loadAWSConfig()` mirrors `loadStorageConfig()` — returns `(awsConfig, bool)` with no error, consistent with the existing pattern.
+- `writeTimestampObject` re-acquires STS credentials on every tick (no caching). Simple and always correct for short-lived (1 h) STS tokens.
+- STS `AssumeRoleWithWebIdentity` call uses `aws.AnonymousCredentials{}` as the AWS request signer — the web identity token IS the credential for this call; no pre-existing AWS credentials are needed.
+- `cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{audienceAppID + "/.default"}})` acquires the Azure AD JWT for the dedicated Entra app audience. This requires the `azcore/policy` import, which was already an indirect dep (via azidentity) but now promoted to direct use.
+- AWS SDK v2 packages added: `aws`, `config` (aliased `awsconfig`), `credentials` (aliased `awscredentials`), `service/s3`, `service/sts`. `go get` upgraded the module from go 1.22 → 1.24.
+- S3 object key convention: `timestamps/timestamp-{RFC3339}.txt` — matches blob naming, sorts visually in the S3 console.
+- Azure write path unchanged — the tick loop now logs "azure blob written" / "s3 object written" separately so failures are distinguishable in structured logs.
+
+### 2026-04-30 — AWS Option B orchestration & documentation complete
+
+- Session orchestration via Scribe: merged 3 decision inbox files into primary decisions.md (Dallas, Hudson, Bishop implementation notes now documented as detailed decision entries).
+- Deleted decision inbox files after merge; decisions.md now 21,689 → ~33KB (detailed implementation decisions captured).
+- Orchestration logs created per agent; session log written.
+- Coordinated with Hudson (deployment env vars) and Bishop (docs clarity) to ensure implementation completeness.
+
 ### 2026-04-29 — Verbose code comments added to both Go source files
 
 - `cmd/timestampwriter/main.go` and `cmd/setup/main.go` both received full package-level doc comments, godoc-style function comments, and inline comments on non-obvious logic.
