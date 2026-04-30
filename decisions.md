@@ -113,6 +113,39 @@ The dual-client-ID pattern + defense-in-depth K8s RBAC + Azure RBAC creates a ti
 
 ---
 
+## 2026-04-30: AWS Option B — Azure AD as Stable OIDC Provider (DECISION)
+
+### Decision Summary
+
+Document and support a second AWS authentication path (Option B) in `docs/aws-setup.md` that registers `https://login.microsoftonline.com/<ENTRA_SOURCE_TENANT_ID>/v2.0` as the AWS IAM Identity Provider, rather than the per-cluster AKS OIDC issuer URL (Option A).
+
+### Context
+
+Option A (per-cluster OIDC federation) requires one AWS IAM Identity Provider registration per AKS cluster, creating operational burden that scales linearly with cluster count. Option B exploits the fact that the IB proxy's token exchange output — a UAMI access token — has a stable issuer and subject regardless of which cluster ran the pod.
+
+### Key Technical Facts
+
+1. **Stable cluster-independent issuer:** UAMI access tokens issued by Azure AD have `iss: https://login.microsoftonline.com/<tenantId>/v2.0` across all clusters.
+2. **Stable subject:** The `sub` claim is the UAMI Object ID (service principal), not client ID.
+3. **Dedicated audience app:** Lightweight Entra app registration (`aks-timestampwriter-aws-sts-audience`) provides `aud: api://aws-sts-audience` for AWS STS exchange.
+4. **Explicit STS call:** Application acquires Azure AD JWT via `ManagedIdentityCredential`, calls `sts.AssumeRoleWithWebIdentity` directly, manages credentials provider.
+5. **No aws-identity-token volume:** The `azure-identity-token` from IB webhook serves as starting point for AWS credential chain.
+
+### Consequences
+
+- **Zero AWS changes per cluster:** Adding a new cluster only requires creating the Identity Binding resource.
+- **Higher application complexity:** Explicit STS call + credentials provider vs. AWS SDK's transparent token exchange.
+- **One new Entra resource:** Dedicated app registration for AWS token audience (one-time setup, zero maintenance).
+- **Better security boundary:** Token not directly usable with AWS STS without explicit exchange step.
+
+### Action Items
+
+- **Dallas:** Review Go application changes in Step B5; confirm SDK patterns match timestampwriter use.
+- **Hudson:** Review Step B4 deployment changes; `aws-identity-token` volume removed, `AWS_STS_AUDIENCE_APP_ID` added.
+- **No Azure infrastructure changes** required beyond Entra app registration in Step B1.
+
+---
+
 ## 2026-04-30: AWS + Azure Dual-Cloud Feasibility via AKS Identity Bindings (DECISION)
 
 ### Decision Summary
