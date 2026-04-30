@@ -76,3 +76,10 @@
 - **Implementation steps:** Register AKS cluster OIDC issuer in AWS IAM, create AWS IAM role with trust policy scoped to SA subject + `sts.amazonaws.com` audience, attach least-privilege policy, add second projected volume, configure env vars, add `aws-sdk-go-v2` dependency.
 - **What does NOT change:** IB binding configuration, Azure cross-tenant flow, existing RBAC manifests, existing NetworkPolicy.
 - **Decision merged into primary decisions.md.**
+
+### 2026-04-29 — AWS Dual-Cloud Setup Guide Authored
+
+- **Created `docs/aws-setup.md`** — operator/developer setup guide for the AWS write path alongside the existing cross-tenant Azure write path. Covers: dual-path token coexistence explanation, prerequisites, variables block, five implementation steps, multi-cluster considerations, and security considerations.
+- **Key guidance documented:** One IAM IdP per AKS cluster OIDC issuer (no AWS equivalent of Identity Bindings); trust policy `sub` condition must match `system:serviceaccount:aks-xtenant-auth:timestampwriter` exactly; `aws-identity-token` volume must NOT be named `azure-identity-token` (IB webhook name reservation); no NetworkPolicy changes needed (port 443 egress already allows STS + S3).
+- **Blast radius warning made explicit:** co-located token files in the pod are both accessible to a pod-level read vulnerability — AWS token is directly usable for `AssumeRoleWithWebIdentity`, no further exchange required. Asymmetric scope (tight Azure, broad AWS) is the documented risk. Separate-pod option documented as defense-in-depth.
+- **Application update guidance (no code):** `aws-sdk-go-v2` + `config.LoadDefaultConfig` auto-reads web identity env vars; setup wizard needs extension for S3 bucket/prefix config; errors from Azure and AWS writes should be handled independently.
